@@ -1,251 +1,223 @@
 #!/usr/bin/env python3
 """
-Work Assistant — Raspberry Pi / Linux (Gamepad Hold-to-Talk)
-
-Device: DragonRise/0079 USB Gamepad (event-joystick)
-PTT: Hold BTN_THUMB (your "RED" button on event9) to record.
-Release to transcribe (Whisper) and send to GPT-4o, then speak (espeak-ng/espeak).
+Lab Partner — Raspberry Pi Gamepad Hold-to-Talk Assistant
 """
 
 import os
-import sys
+import json
 import tempfile
 import subprocess
+from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
-
 from dotenv import load_dotenv
 from openai import OpenAI
-
 from evdev import InputDevice, ecodes
 
 # ----------------------------
-# CONFIG
+# DEFAULT CONFIG
 # ----------------------------
 
-# Your stable by-id symlink (from your ls output)
-DEVICE_PATH = "/dev/input/by-id/usb-0079_USB_Gamepad-event-joystick"
-
-# Your RED button on event9 shows up as BTN_THUMB (code 289)
-PTT_KEY = ecodes.BTN_THUMB  # 289
-
-SAMPLE_RATE = 16000
-CHANNELS = 1
-
-MODEL_CHAT = "gpt-4o"
-MODEL_STT = "whisper-1"
-
-# If you record silence, set this to a specific input device index.
-# To list: python -c "import sounddevice as sd; print(sd.query_devices())"
-AUDIO_DEVICE_INDEX = None
+DEFAULT_CONFIG = {
+    "device_path": "/dev/input/by-id/usb-0079_USB_Gamepad-event-joystick",
+    "ptt_key": "BTN_THUMB",
+    "sample_rate": 16000,
+    "models": {
+        "stt": "whisper-1",
+        "chat": "gpt-4o"
+    },
+    "tts": {
+        "engine": "espeak-ng",
+        "voice": "en-us",
+        "rate": 175
+    },
+    "logging": {
+        "enabled": True,
+        "path": "logs/conversation.jsonl",
+        "max_turns_in_memory": 12
+    }
+}
 
 # ----------------------------
-# Setup
+# CONFIG LOADER
+# ----------------------------
+
+def _deep_merge(base, override):
+    result = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(result.get(k), dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+def load_config(path="config.json"):
+    config = dict(DEFAULT_CONFIG)
+    p = Path(path)
+
+    if p.exists():
+        with p.open("r", encoding="utf-8") as f:
+            user_config = json.load(f)
+        config = _deep_merge(config, user_config)
+
+    # Validate sample rate
+    if not isinstance(config["sample_rate"], int) or config["sample_rate"] <= 0:
+        raise ValueError("sample_rate must be a positive integer")
+
+    # Map string key to evdev code
+    key_name = config.get("ptt_key", "BTN_THUMB")
+    if isinstance(key_name, str):
+        if not hasattr(ecodes, key_name):
+            raise ValueError(f"Unknown ptt_key '{key_name}'")
+        config["ptt_key_code"] = getattr(ecodes, key_name)
+    else:
+        config["ptt_key_code"] = int(key_name)
+
+    return config
+
+
+def append_jsonl(path, obj):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+# ----------------------------
+# INITIALIZE
 # ----------------------------
 
 load_dotenv()
+client = OpenAI()
 
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    print("\n❌ Error: OPENAI_API_KEY not found. Put it in .env or export it.\n")
-    sys.exit(1)
+cfg = load_config()
 
-client = OpenAI(api_key=api_key)
+DEVICE_PATH = cfg["device_path"]
+PTT_KEY = cfg["ptt_key_code"]
+SAMPLE_RATE = cfg["sample_rate"]
 
-# Conversation history (persists for the session)
-conversation_history = [
-    {
-        "role": "system",
-        "content": (
-            "You are a sharp, efficient work assistant helping with podcast production. "
-            "You help analyze content, suggest debate angles, summarize ideas, and support "
-            "the creative workflow. Keep responses concise and spoken-word friendly — "
-            "no markdown, no bullet symbols, just clean natural speech."
+STT_MODEL = cfg["models"]["stt"]
+CHAT_MODEL = cfg["models"]["chat"]
+
+TTS_ENGINE = cfg["tts"]["engine"]
+TTS_VOICE = cfg["tts"]["voice"]
+TTS_RATE = cfg["tts"]["rate"]
+
+LOG_ENABLED = cfg["logging"]["enabled"]
+LOG_PATH = cfg["logging"]["path"]
+MAX_TURNS = cfg["logging"]["max_turns_in_memory"]
+
+messages = []
+
+
+# ----------------------------
+# AUDIO FUNCTIONS
+# ----------------------------
+
+def record_audio():
+    print("Recording...")
+    recording = []
+
+    def callback(indata, frames, time, status):
+        recording.append(indata.copy())
+
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=callback):
+        while button_held:
+            sd.sleep(50)
+
+    audio = np.concatenate(recording, axis=0)
+    return audio
+
+
+def transcribe_audio(audio):
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        sf.write(tmp.name, audio, SAMPLE_RATE)
+        tmp_path = tmp.name
+
+    with open(tmp_path, "rb") as f:
+        transcript = client.audio.transcriptions.create(
+            model=STT_MODEL,
+            file=f
         )
-    }
-]
+
+    os.unlink(tmp_path)
+    return transcript.text
 
 
-# ----------------------------
-# TTS
-# ----------------------------
+def chat_with_model(user_text):
+    global messages
 
-def speak(text: str):
-    """Try Linux TTS; always print."""
-    print(f"\n🤖 Assistant: {text}\n")
-
-    # Prefer espeak-ng, then espeak. If neither installed, just print.
-    for cmd in (["espeak-ng", text], ["espeak", text]):
-        try:
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return
-        except FileNotFoundError:
-            continue
-
-
-# ----------------------------
-# OpenAI: chat + transcription
-# ----------------------------
-
-def chat(user_input: str) -> str:
-    """Send message to GPT and get response."""
-    conversation_history.append({"role": "user", "content": user_input})
+    messages.append({"role": "user", "content": user_text})
+    messages = messages[-MAX_TURNS:]
 
     response = client.chat.completions.create(
-        model=MODEL_CHAT,
-        messages=conversation_history,
-        temperature=0.7,
-        max_tokens=500,
+        model=CHAT_MODEL,
+        messages=messages
     )
 
     reply = response.choices[0].message.content
-    conversation_history.append({"role": "assistant", "content": reply})
+    messages.append({"role": "assistant", "content": reply})
+
     return reply
 
 
-def transcribe_audio(file_path: str) -> str:
-    """Send recorded audio to OpenAI Whisper and return transcript."""
-    print("📝 Transcribing audio...")
-    with open(file_path, "rb") as f:
-        result = client.audio.transcriptions.create(
-            model=MODEL_STT,
-            file=f,
-        )
-    text = getattr(result, "text", "") or ""
-    print(f"🗣️  You (via STT): {text}\n")
-    return text
-
-
-# ----------------------------
-# Hold-to-talk recorder
-# ----------------------------
-
-class HoldRecorder:
-    def __init__(self, samplerate=16000, channels=1, device_index=None):
-        self.samplerate = samplerate
-        self.channels = channels
-        self.device_index = device_index
-        self.stream = None
-        self.frames = []
-        self.recording = False
-
-    def _callback(self, indata, frames, time_info, status):
-        # status may contain xruns/overflows; we keep going.
-        if self.recording:
-            self.frames.append(indata.copy())
-
-    def start(self):
-        if self.recording:
-            return
-
-        self.frames = []
-        self.recording = True
-
-        self.stream = sd.InputStream(
-            samplerate=self.samplerate,
-            channels=self.channels,
-            dtype="float32",
-            callback=self._callback,
-            device=self.device_index,
-        )
-        self.stream.start()
-        print("🔴 Recording... (hold RED / BTN_THUMB)")
-
-    def stop_save_wav(self) -> str | None:
-        if not self.recording:
-            return None
-
-        self.recording = False
-        try:
-            if self.stream:
-                self.stream.stop()
-                self.stream.close()
-        finally:
-            self.stream = None
-
-        if not self.frames:
-            print("⚠️ No audio captured.")
-            return None
-
-        audio = np.concatenate(self.frames, axis=0)
-
-        fd, path = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        sf.write(path, audio, self.samplerate)
-        print(f"✅ Saved: {path}")
-        return path
-
-
-# ----------------------------
-# Main loop: gamepad events
-# ----------------------------
-
-def main():
-    if not os.path.exists(DEVICE_PATH):
-        print(f"\n❌ Device path not found:\n  {DEVICE_PATH}\n")
-        print("Check with: ls -l /dev/input/by-id/\n")
-        sys.exit(1)
-
-    dev = InputDevice(DEVICE_PATH)
-
-    print("=" * 62)
-    print("  Raspberry Pi Work Assistant (Gamepad Hold-to-Talk)")
-    print("=" * 62)
-    print(f"  Input device : {dev.path} ({dev.name})")
-    print("  Action       : Hold RED (BTN_THUMB) to talk → release to send")
-    print("  Quit         : Ctrl+C")
-    print("=" * 62)
-    print("✅ Ready.\n")
-
-    recorder = HoldRecorder(
-        samplerate=SAMPLE_RATE,
-        channels=CHANNELS,
-        device_index=AUDIO_DEVICE_INDEX,
+def speak(text):
+    subprocess.run(
+        [TTS_ENGINE, "-v", TTS_VOICE, "-s", str(TTS_RATE), text],
+        check=False
     )
 
-    try:
-        for event in dev.read_loop():
-            if event.type != ecodes.EV_KEY:
-                continue
 
-            if event.code != PTT_KEY:
-                continue
+# ----------------------------
+# MAIN LOOP
+# ----------------------------
 
-            # event.value: 1=down, 0=up, 2=repeat/hold (ignore 2)
-            if event.value == 1:
-                print("🎮 PTT down (BTN_THUMB)")
-                recorder.start()
+print("==============================================")
+print(" Lab Partner — Raspberry Pi Voice Assistant ")
+print("==============================================")
+print(" Hold button to speak. Release to send.")
+print(" Ctrl+C to quit.")
+print()
 
-            elif event.value == 0:
-                print("🎮 PTT up (BTN_THUMB)")
-                wav_path = recorder.stop_save_wav()
-                if not wav_path:
-                    continue
+device = InputDevice(DEVICE_PATH)
 
-                try:
-                    user_text = transcribe_audio(wav_path).strip()
-                    if not user_text:
-                        print("⚠️ No speech detected.")
-                        continue
+button_held = False
 
-                    print("⏳ Thinking...")
-                    reply = chat(user_text)
-                    speak(reply)
+for event in device.read_loop():
+    if event.type == ecodes.EV_KEY and event.code == PTT_KEY:
+        if event.value == 1:  # Button pressed
+            button_held = True
+            audio_data = record_audio()
 
-                except Exception as e:
-                    print(f"❌ Error processing audio: {e}")
+        elif event.value == 0:  # Button released
+            button_held = False
 
-                finally:
-                    try:
-                        os.remove(wav_path)
-                    except OSError:
-                        pass
+            try:
+                transcript = transcribe_audio(audio_data)
+                print(f"\nYou: {transcript}")
 
-    except KeyboardInterrupt:
-        print("\n👋 Exiting assistant. Goodbye!")
+                if LOG_ENABLED:
+                    append_jsonl(LOG_PATH, {
+                        "ts": datetime.now().isoformat(),
+                        "role": "user",
+                        "text": transcript
+                    })
 
+                reply = chat_with_model(transcript)
+                print(f"Assistant: {reply}\n")
 
-if __name__ == "__main__":
-    main()
+                if LOG_ENABLED:
+                    append_jsonl(LOG_PATH, {
+                        "ts": datetime.now().isoformat(),
+                        "role": "assistant",
+                        "text": reply
+                    })
+
+                speak(reply)
+
+            except Exception as e:
+                print(f"Error: {e}")

@@ -1,0 +1,22 @@
+{
+  "device_path": "/dev/input/by-id/usb-0079_USB_Gamepad-event-joystick",
+  "ptt_key": "BTN_THUMB",
+  "sample_rate": 16000,
+
+  "models": {
+    "stt": "whisper-1",
+    "chat": "gpt-4o"
+  },
+
+  "tts": {
+    "engine": "espeak-ng",
+    "voice": "en-us",
+    "rate": 175
+  },
+
+  "logging": {
+    "enabled": true,
+    "path": "logs/conversation.jsonl",
+    "max_turns_in_memory": 12
+  }
+}
