@@ -1,7 +1,15 @@
+# Environment files
 .env
+*.env
+
+# Python
 venv/
 __pycache__/
+*.pyc
+
+# OS
 .DS_Store
-*.wav
-*.mp3   
 ._*
+
+# Logs
+logs/
