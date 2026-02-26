@@ -7,6 +7,7 @@ import os
 import json
 import tempfile
 import subprocess
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -25,25 +26,15 @@ DEFAULT_CONFIG = {
     "device_path": "/dev/input/by-id/usb-0079_USB_Gamepad-event-joystick",
     "ptt_key": "BTN_THUMB",
     "sample_rate": 16000,
-    "models": {
-        "stt": "whisper-1",
-        "chat": "gpt-4o"
-    },
-    "tts": {
-        "engine": "espeak-ng",
-        "voice": "en-us",
-        "rate": 175
-    },
-    "logging": {
-        "enabled": True,
-        "path": "logs/conversation.jsonl",
-        "max_turns_in_memory": 12
-    }
+    "models": {"stt": "whisper-1", "chat": "gpt-4o"},
+    "tts": {"engine": "espeak-ng", "voice": "en-us", "rate": 175},
+    "logging": {"enabled": True, "path": "logs/conversation.jsonl", "max_turns_in_memory": 12},
 }
 
 # ----------------------------
 # CONFIG LOADER
 # ----------------------------
+
 
 def _deep_merge(base, override):
     result = dict(base)
@@ -64,15 +55,13 @@ def load_config(path="config.json"):
             user_config = json.load(f)
         config = _deep_merge(config, user_config)
 
-    # Validate sample rate
     if not isinstance(config["sample_rate"], int) or config["sample_rate"] <= 0:
         raise ValueError("sample_rate must be a positive integer")
 
-    # Map string key to evdev code
     key_name = config.get("ptt_key", "BTN_THUMB")
     if isinstance(key_name, str):
         if not hasattr(ecodes, key_name):
-            raise ValueError(f"Unknown ptt_key '{key_name}'")
+            raise ValueError(f"Unknown ptt_key '{key_name}'. Try something like 'BTN_THUMB'.")
         config["ptt_key_code"] = getattr(ecodes, key_name)
     else:
         config["ptt_key_code"] = int(key_name)
@@ -118,37 +107,51 @@ messages = []
 # AUDIO FUNCTIONS
 # ----------------------------
 
-def record_audio():
-    print("Recording...")
-    recording = []
 
-    def callback(indata, frames, time, status):
-        recording.append(indata.copy())
+def record_audio_until(stop_event: threading.Event) -> np.ndarray:
+    """Record mic audio until stop_event is set. Returns float32 mono array shape (N, 1)."""
+    print("Recording...")
+    chunks: list[np.ndarray] = []
+
+    def callback(indata, frames, time_info, status):
+        if status:
+            # xruns etc. Not fatal.
+            print(status)
+        chunks.append(indata.copy())
 
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=callback):
-        while button_held:
+        while not stop_event.is_set():
             sd.sleep(50)
 
-    audio = np.concatenate(recording, axis=0)
-    return audio
+    if not chunks:
+        return np.zeros((0, 1), dtype=np.float32)
+
+    return np.concatenate(chunks, axis=0)
 
 
-def transcribe_audio(audio):
+def transcribe_audio(audio: np.ndarray) -> str:
+    if audio is None or audio.size == 0:
+        return ""
+
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         sf.write(tmp.name, audio, SAMPLE_RATE)
         tmp_path = tmp.name
 
-    with open(tmp_path, "rb") as f:
-        transcript = client.audio.transcriptions.create(
-            model=STT_MODEL,
-            file=f
-        )
+    try:
+        with open(tmp_path, "rb") as f:
+            transcript = client.audio.transcriptions.create(
+                model=STT_MODEL,
+                file=f,
+            )
+        return transcript.text.strip()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
-    os.unlink(tmp_path)
-    return transcript.text
 
-
-def chat_with_model(user_text):
+def chat_with_model(user_text: str) -> str:
     global messages
 
     messages.append({"role": "user", "content": user_text})
@@ -156,19 +159,20 @@ def chat_with_model(user_text):
 
     response = client.chat.completions.create(
         model=CHAT_MODEL,
-        messages=messages
+        messages=messages,
     )
 
-    reply = response.choices[0].message.content
+    reply = response.choices[0].message.content.strip()
     messages.append({"role": "assistant", "content": reply})
-
     return reply
 
 
-def speak(text):
+def speak(text: str) -> None:
+    if not text:
+        return
     subprocess.run(
         [TTS_ENGINE, "-v", TTS_VOICE, "-s", str(TTS_RATE), text],
-        check=False
+        check=False,
     )
 
 
@@ -185,39 +189,87 @@ print()
 
 device = InputDevice(DEVICE_PATH)
 
-button_held = False
+# Recording state
+is_recording = False
+stop_event: threading.Event | None = None
+recording_thread: threading.Thread | None = None
+audio_data: np.ndarray | None = None
 
-for event in device.read_loop():
-    if event.type == ecodes.EV_KEY and event.code == PTT_KEY:
-        if event.value == 1:  # Button pressed
-            button_held = True
-            audio_data = record_audio()
 
-        elif event.value == 0:  # Button released
-            button_held = False
+def _start_recording():
+    global stop_event, recording_thread, audio_data, is_recording
 
-            try:
-                transcript = transcribe_audio(audio_data)
-                print(f"\nYou: {transcript}")
+    if is_recording:
+        return
 
-                if LOG_ENABLED:
-                    append_jsonl(LOG_PATH, {
-                        "ts": datetime.now().isoformat(),
-                        "role": "user",
-                        "text": transcript
-                    })
+    is_recording = True
+    stop_event = threading.Event()
+    audio_data = None
 
-                reply = chat_with_model(transcript)
-                print(f"Assistant: {reply}\n")
+    def runner():
+        global audio_data
+        audio_data = record_audio_until(stop_event)
 
-                if LOG_ENABLED:
-                    append_jsonl(LOG_PATH, {
-                        "ts": datetime.now().isoformat(),
-                        "role": "assistant",
-                        "text": reply
-                    })
+    recording_thread = threading.Thread(target=runner, daemon=True)
+    recording_thread.start()
 
-                speak(reply)
 
-            except Exception as e:
-                print(f"Error: {e}")
+def _stop_recording_and_process():
+    global stop_event, recording_thread, is_recording, audio_data
+
+    if not is_recording:
+        return
+
+    is_recording = False
+    if stop_event is not None:
+        stop_event.set()
+
+    if recording_thread is not None:
+        recording_thread.join(timeout=2.0)
+
+    try:
+        transcript = transcribe_audio(audio_data)
+
+        if not transcript:
+            print("\n(heard nothing — try again)\n")
+            return
+
+        print(f"\nYou: {transcript}")
+
+        if LOG_ENABLED:
+            append_jsonl(
+                LOG_PATH,
+                {"ts": datetime.now().isoformat(), "role": "user", "text": transcript},
+            )
+
+        reply = chat_with_model(transcript)
+        print(f"Assistant: {reply}\n")
+
+        if LOG_ENABLED:
+            append_jsonl(
+                LOG_PATH,
+                {"ts": datetime.now().isoformat(), "role": "assistant", "text": reply},
+            )
+
+        speak(reply)
+
+    except Exception as e:
+        print(f"Error: {e}")
+
+
+try:
+    for event in device.read_loop():
+        # Only pay attention to our configured PTT key
+        if event.type != ecodes.EV_KEY or event.code != PTT_KEY:
+            continue
+
+        # Press
+        if event.value == 1:
+            _start_recording()
+
+        # Release
+        elif event.value == 0:
+            _stop_recording_and_process()
+
+except KeyboardInterrupt:
+    print("\nExiting...")
