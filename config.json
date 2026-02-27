@@ -1,22 +1,16 @@
 {
-  "device_path": "/dev/input/by-id/usb-0079_USB_Gamepad-event-joystick",
-  "ptt_key": "BTN_THUMB",
-  "sample_rate": 16000,
-
-  "models": {
-    "stt": "whisper-1",
-    "chat": "gpt-4o"
+  "buttons": {
+    "red_ptt": "BTN_THUMB",
+    "green_ptt": "BTN_TOP"
   },
-
-  "tts": {
-    "engine": "espeak-ng",
-    "voice": "en-us",
-    "rate": 175
-  },
-
-  "logging": {
-    "enabled": true,
-    "path": "logs/conversation.jsonl",
-    "max_turns_in_memory": 12
+  "routes": {
+    "red": {
+      "backend": "openai",
+      "chat_model": "gpt-4o"
+    },
+    "green": {
+      "backend": "ollama",
+      "ollama_model": "qwen2.5:1.5b-instruct"
+    }
   }
 }

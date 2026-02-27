@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Lab Partner — Raspberry Pi Gamepad Hold-to-Talk Assistant
+Lab Partner — Raspberry Pi Dual PTT + Interrupt
+Red = OpenAI
+Green = Ollama
+Yellow (BTN_BASE2) = Interrupt
 """
 
 import os
@@ -10,6 +13,7 @@ import subprocess
 import threading
 from pathlib import Path
 from datetime import datetime
+import requests
 
 import numpy as np
 import sounddevice as sd
@@ -18,23 +22,58 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from evdev import InputDevice, ecodes
 
+
 # ----------------------------
 # DEFAULT CONFIG
 # ----------------------------
 
 DEFAULT_CONFIG = {
     "device_path": "/dev/input/by-id/usb-0079_USB_Gamepad-event-joystick",
-    "ptt_key": "BTN_THUMB",
     "sample_rate": 16000,
-    "models": {"stt": "whisper-1", "chat": "gpt-4o"},
-    "tts": {"engine": "espeak-ng", "voice": "en-us", "rate": 175},
-    "logging": {"enabled": True, "path": "logs/conversation.jsonl", "max_turns_in_memory": 12},
+
+    "models": {
+        "stt": "whisper-1",
+        "chat": "gpt-4o"
+    },
+
+    "tts": {
+        "engine": "espeak-ng",
+        "voice": "en-us",
+        "rate": 175
+    },
+
+    "logging": {
+        "enabled": True,
+        "path": "logs/conversation.jsonl",
+        "max_turns_in_memory": 12
+    },
+
+    "context": {
+        "local_turns": 6
+    },
+
+    "buttons": {
+        "red_ptt": "BTN_THUMB",
+        "green_ptt": "BTN_TOP",
+        "interrupt": "BTN_BASE2"
+    },
+
+    "routes": {
+        "red": {
+            "backend": "openai",
+            "chat_model": "gpt-4o"
+        },
+        "green": {
+            "backend": "ollama",
+            "ollama_model": "qwen2.5:1.5b-instruct"
+        }
+    }
 }
 
-# ----------------------------
-# CONFIG LOADER
-# ----------------------------
 
+# ----------------------------
+# CONFIG
+# ----------------------------
 
 def _deep_merge(base, override):
     result = dict(base)
@@ -46,25 +85,24 @@ def _deep_merge(base, override):
     return result
 
 
+def _ecode(name):
+    if not hasattr(ecodes, name):
+        raise ValueError(f"Unknown button '{name}'")
+    return getattr(ecodes, name)
+
+
 def load_config(path="config.json"):
     config = dict(DEFAULT_CONFIG)
     p = Path(path)
 
     if p.exists():
-        with p.open("r", encoding="utf-8") as f:
-            user_config = json.load(f)
-        config = _deep_merge(config, user_config)
+        with p.open("r") as f:
+            config = _deep_merge(config, json.load(f))
 
-    if not isinstance(config["sample_rate"], int) or config["sample_rate"] <= 0:
-        raise ValueError("sample_rate must be a positive integer")
-
-    key_name = config.get("ptt_key", "BTN_THUMB")
-    if isinstance(key_name, str):
-        if not hasattr(ecodes, key_name):
-            raise ValueError(f"Unknown ptt_key '{key_name}'. Try something like 'BTN_THUMB'.")
-        config["ptt_key_code"] = getattr(ecodes, key_name)
-    else:
-        config["ptt_key_code"] = int(key_name)
+    buttons = config["buttons"]
+    config["red_key"] = _ecode(buttons["red_ptt"])
+    config["green_key"] = _ecode(buttons["green_ptt"])
+    config["interrupt_key"] = _ecode(buttons["interrupt"])
 
     return config
 
@@ -73,11 +111,11 @@ def append_jsonl(path, obj):
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        f.write(json.dumps(obj) + "\n")
 
 
 # ----------------------------
-# INITIALIZE
+# INIT
 # ----------------------------
 
 load_dotenv()
@@ -86,37 +124,39 @@ client = OpenAI()
 cfg = load_config()
 
 DEVICE_PATH = cfg["device_path"]
-PTT_KEY = cfg["ptt_key_code"]
 SAMPLE_RATE = cfg["sample_rate"]
+LOCAL_TURNS = cfg["context"]["local_turns"]
 
-STT_MODEL = cfg["models"]["stt"]
-CHAT_MODEL = cfg["models"]["chat"]
+RED_KEY = cfg["red_key"]
+GREEN_KEY = cfg["green_key"]
+INTERRUPT_KEY = cfg["interrupt_key"]
 
-TTS_ENGINE = cfg["tts"]["engine"]
-TTS_VOICE = cfg["tts"]["voice"]
-TTS_RATE = cfg["tts"]["rate"]
+ROUTES = cfg["routes"]
 
 LOG_ENABLED = cfg["logging"]["enabled"]
 LOG_PATH = cfg["logging"]["path"]
 MAX_TURNS = cfg["logging"]["max_turns_in_memory"]
 
+TTS_ENGINE = cfg["tts"]["engine"]
+TTS_VOICE = cfg["tts"]["voice"]
+TTS_RATE = cfg["tts"]["rate"]
+
 messages = []
 
+# interrupt control
+cancel_turn = threading.Event()
+tts_proc = None
+tts_lock = threading.Lock()
+
 
 # ----------------------------
-# AUDIO FUNCTIONS
+# AUDIO
 # ----------------------------
 
-
-def record_audio_until(stop_event: threading.Event) -> np.ndarray:
-    """Record mic audio until stop_event is set. Returns float32 mono array shape (N, 1)."""
-    print("Recording...")
-    chunks: list[np.ndarray] = []
+def record_audio(stop_event):
+    chunks = []
 
     def callback(indata, frames, time_info, status):
-        if status:
-            # xruns etc. Not fatal.
-            print(status)
         chunks.append(indata.copy())
 
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=callback):
@@ -129,8 +169,8 @@ def record_audio_until(stop_event: threading.Event) -> np.ndarray:
     return np.concatenate(chunks, axis=0)
 
 
-def transcribe_audio(audio: np.ndarray) -> str:
-    if audio is None or audio.size == 0:
+def transcribe(audio):
+    if audio.size == 0:
         return ""
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -139,41 +179,108 @@ def transcribe_audio(audio: np.ndarray) -> str:
 
     try:
         with open(tmp_path, "rb") as f:
-            transcript = client.audio.transcriptions.create(
-                model=STT_MODEL,
-                file=f,
+            resp = client.audio.transcriptions.create(
+                model=cfg["models"]["stt"],
+                file=f
             )
-        return transcript.text.strip()
+        return resp.text.strip()
     finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        os.unlink(tmp_path)
 
 
-def chat_with_model(user_text: str) -> str:
+# ----------------------------
+# CHAT
+# ----------------------------
+
+def _trim():
     global messages
-
-    messages.append({"role": "user", "content": user_text})
     messages = messages[-MAX_TURNS:]
 
-    response = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=messages,
+
+def chat_openai(text, model):
+    messages.append({"role": "user", "content": text})
+    _trim()
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages
     )
 
-    reply = response.choices[0].message.content.strip()
+    reply = resp.choices[0].message.content.strip()
     messages.append({"role": "assistant", "content": reply})
+    _trim()
     return reply
 
 
-def speak(text: str) -> None:
+def _local_prompt():
+    lines = ["You are Lab Partner, a concise workshop assistant.\n"]
+
+    for m in messages[-LOCAL_TURNS:]:
+        role = "User" if m["role"] == "user" else "Assistant"
+        lines.append(f"{role}: {m['content']}")
+
+    lines.append("Assistant:")
+    return "\n".join(lines)
+
+
+def chat_ollama(text, model):
+    messages.append({"role": "user", "content": text})
+    _trim()
+
+    prompt = _local_prompt()
+    print("Thinking (local)...")
+
+    r = requests.post(
+        "http://127.0.0.1:11434/api/generate",
+        json={"model": model, "prompt": prompt, "stream": False},
+        timeout=180,
+    )
+    r.raise_for_status()
+
+    reply = r.json().get("response", "").strip()
+    messages.append({"role": "assistant", "content": reply})
+    _trim()
+    return reply
+
+
+def generate(text, route):
+    backend = route["backend"]
+    if backend == "openai":
+        return chat_openai(text, route["chat_model"]), "openai"
+    if backend == "ollama":
+        return chat_ollama(text, route["ollama_model"]), "ollama"
+    raise ValueError("Unknown backend")
+
+
+# ----------------------------
+# INTERRUPTIBLE SPEECH
+# ----------------------------
+
+def speak(text):
+    global tts_proc
     if not text:
         return
-    subprocess.run(
-        [TTS_ENGINE, "-v", TTS_VOICE, "-s", str(TTS_RATE), text],
-        check=False,
-    )
+
+    with tts_lock:
+        if tts_proc and tts_proc.poll() is None:
+            tts_proc.terminate()
+
+        tts_proc = subprocess.Popen(
+            [TTS_ENGINE, "-v", TTS_VOICE, "-s", str(TTS_RATE), text],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+
+def interrupt():
+    cancel_turn.set()
+    global tts_proc
+
+    with tts_lock:
+        if tts_proc and tts_proc.poll() is None:
+            tts_proc.terminate()
+
+    print("(interrupted)")
 
 
 # ----------------------------
@@ -181,95 +288,63 @@ def speak(text: str) -> None:
 # ----------------------------
 
 print("==============================================")
-print(" Lab Partner — Raspberry Pi Voice Assistant ")
+print(" Lab Partner — Dual PTT + Interrupt")
 print("==============================================")
-print(" Hold button to speak. Release to send.")
-print(" Ctrl+C to quit.")
-print()
+print("Red = OpenAI | Green = Local | Yellow = Interrupt")
+print("Ctrl+C to quit.\n")
 
 device = InputDevice(DEVICE_PATH)
 
-# Recording state
 is_recording = False
-stop_event: threading.Event | None = None
-recording_thread: threading.Thread | None = None
-audio_data: np.ndarray | None = None
-
-
-def _start_recording():
-    global stop_event, recording_thread, audio_data, is_recording
-
-    if is_recording:
-        return
-
-    is_recording = True
-    stop_event = threading.Event()
-    audio_data = None
-
-    def runner():
-        global audio_data
-        audio_data = record_audio_until(stop_event)
-
-    recording_thread = threading.Thread(target=runner, daemon=True)
-    recording_thread.start()
-
-
-def _stop_recording_and_process():
-    global stop_event, recording_thread, is_recording, audio_data
-
-    if not is_recording:
-        return
-
-    is_recording = False
-    if stop_event is not None:
-        stop_event.set()
-
-    if recording_thread is not None:
-        recording_thread.join(timeout=2.0)
-
-    try:
-        transcript = transcribe_audio(audio_data)
-
-        if not transcript:
-            print("\n(heard nothing — try again)\n")
-            return
-
-        print(f"\nYou: {transcript}")
-
-        if LOG_ENABLED:
-            append_jsonl(
-                LOG_PATH,
-                {"ts": datetime.now().isoformat(), "role": "user", "text": transcript},
-            )
-
-        reply = chat_with_model(transcript)
-        print(f"Assistant: {reply}\n")
-
-        if LOG_ENABLED:
-            append_jsonl(
-                LOG_PATH,
-                {"ts": datetime.now().isoformat(), "role": "assistant", "text": reply},
-            )
-
-        speak(reply)
-
-    except Exception as e:
-        print(f"Error: {e}")
+stop_event = None
+audio = None
+active_route = None
 
 
 try:
     for event in device.read_loop():
-        # Only pay attention to our configured PTT key
-        if event.type != ecodes.EV_KEY or event.code != PTT_KEY:
+
+        if event.type != ecodes.EV_KEY:
             continue
 
-        # Press
-        if event.value == 1:
-            _start_recording()
+        if event.code == INTERRUPT_KEY and event.value == 1:
+            interrupt()
+            continue
 
-        # Release
-        elif event.value == 0:
-            _stop_recording_and_process()
+        if event.code in (RED_KEY, GREEN_KEY):
+
+            if event.value == 1:  # press
+                cancel_turn.clear()
+                is_recording = True
+                stop_event = threading.Event()
+
+                active_route = ROUTES["red"] if event.code == RED_KEY else ROUTES["green"]
+
+                def runner():
+                    global audio
+                    audio = record_audio(stop_event)
+
+                threading.Thread(target=runner, daemon=True).start()
+
+            elif event.value == 0 and is_recording:  # release
+                is_recording = False
+                stop_event.set()
+
+                text = transcribe(audio)
+                if not text:
+                    continue
+
+                print("\nYou:", text)
+
+                reply, backend = generate(text, active_route)
+
+                if cancel_turn.is_set():
+                    print("(cancelled turn — ignoring reply)")
+                    continue
+
+                print(f"Assistant ({backend}): {reply}\n")
+
+                speak(reply)
 
 except KeyboardInterrupt:
     print("\nExiting...")
