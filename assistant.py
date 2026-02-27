@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Lab Partner — Raspberry Pi Dual PTT + Interrupt
-Red = OpenAI
-Green = Ollama
-Yellow (BTN_BASE2) = Interrupt
+Lab Partner — Dual PTT + Interrupt
+Red   = OpenAI (PTT hold)
+Green = Ollama (PTT hold)
+Yellow/Interrupt = BTN_PINKIE (press to interrupt speech + cancel current turn)
+
+Notes:
+- Prints "recording (openai)..." / "recording (local)..." when PTT is pressed
+- Prints "interrupted" when interrupt is pressed
 """
 
 import os
@@ -12,9 +16,8 @@ import tempfile
 import subprocess
 import threading
 from pathlib import Path
-from datetime import datetime
-import requests
 
+import requests
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
@@ -55,7 +58,8 @@ DEFAULT_CONFIG = {
     "buttons": {
         "red_ptt": "BTN_THUMB",
         "green_ptt": "BTN_TOP",
-        "interrupt": "BTN_BASE2"
+        # IMPORTANT: your evtest shows interrupt is BTN_PINKIE (code 293)
+        "interrupt": "BTN_PINKIE"
     },
 
     "routes": {
@@ -72,7 +76,7 @@ DEFAULT_CONFIG = {
 
 
 # ----------------------------
-# CONFIG
+# CONFIG HELPERS
 # ----------------------------
 
 def _deep_merge(base, override):
@@ -85,9 +89,9 @@ def _deep_merge(base, override):
     return result
 
 
-def _ecode(name):
+def _ecode(name: str) -> int:
     if not hasattr(ecodes, name):
-        raise ValueError(f"Unknown button '{name}'")
+        raise ValueError(f"Unknown button '{name}' (not in evdev.ecodes)")
     return getattr(ecodes, name)
 
 
@@ -96,7 +100,7 @@ def load_config(path="config.json"):
     p = Path(path)
 
     if p.exists():
-        with p.open("r") as f:
+        with p.open("r", encoding="utf-8") as f:
             config = _deep_merge(config, json.load(f))
 
     buttons = config["buttons"]
@@ -143,17 +147,20 @@ TTS_RATE = cfg["tts"]["rate"]
 
 messages = []
 
-# interrupt control
+# interrupt + recording control
 cancel_turn = threading.Event()
 tts_proc = None
 tts_lock = threading.Lock()
+
+record_thread = None
+audio_buffer = None
 
 
 # ----------------------------
 # AUDIO
 # ----------------------------
 
-def record_audio(stop_event):
+def record_audio(stop_event: threading.Event):
     chunks = []
 
     def callback(indata, frames, time_info, status):
@@ -169,8 +176,8 @@ def record_audio(stop_event):
     return np.concatenate(chunks, axis=0)
 
 
-def transcribe(audio):
-    if audio.size == 0:
+def transcribe(audio) -> str:
+    if audio is None or getattr(audio, "size", 0) == 0:
         return ""
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -183,9 +190,12 @@ def transcribe(audio):
                 model=cfg["models"]["stt"],
                 file=f
             )
-        return resp.text.strip()
+        return (resp.text or "").strip()
     finally:
-        os.unlink(tmp_path)
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
 
 
 # ----------------------------
@@ -197,7 +207,7 @@ def _trim():
     messages = messages[-MAX_TURNS:]
 
 
-def chat_openai(text, model):
+def chat_openai(text: str, model: str) -> str:
     messages.append({"role": "user", "content": text})
     _trim()
 
@@ -206,29 +216,27 @@ def chat_openai(text, model):
         messages=messages
     )
 
-    reply = resp.choices[0].message.content.strip()
+    reply = (resp.choices[0].message.content or "").strip()
     messages.append({"role": "assistant", "content": reply})
     _trim()
     return reply
 
 
-def _local_prompt():
+def _local_prompt() -> str:
     lines = ["You are Lab Partner, a concise workshop assistant.\n"]
-
     for m in messages[-LOCAL_TURNS:]:
         role = "User" if m["role"] == "user" else "Assistant"
         lines.append(f"{role}: {m['content']}")
-
     lines.append("Assistant:")
     return "\n".join(lines)
 
 
-def chat_ollama(text, model):
+def chat_ollama(text: str, model: str) -> str:
     messages.append({"role": "user", "content": text})
     _trim()
 
     prompt = _local_prompt()
-    print("Thinking (local)...")
+    print("Thinking (local)...", flush=True)
 
     r = requests.post(
         "http://127.0.0.1:11434/api/generate",
@@ -237,33 +245,38 @@ def chat_ollama(text, model):
     )
     r.raise_for_status()
 
-    reply = r.json().get("response", "").strip()
+    reply = (r.json().get("response") or "").strip()
     messages.append({"role": "assistant", "content": reply})
     _trim()
     return reply
 
 
-def generate(text, route):
+def generate(text: str, route: dict):
     backend = route["backend"]
     if backend == "openai":
         return chat_openai(text, route["chat_model"]), "openai"
     if backend == "ollama":
         return chat_ollama(text, route["ollama_model"]), "ollama"
-    raise ValueError("Unknown backend")
+    raise ValueError(f"Unknown backend: {backend}")
 
 
 # ----------------------------
 # INTERRUPTIBLE SPEECH
 # ----------------------------
 
-def speak(text):
+def speak(text: str):
+    """Start TTS; if already speaking, stop and replace."""
     global tts_proc
     if not text:
         return
 
     with tts_lock:
+        # stop any currently-speaking process
         if tts_proc and tts_proc.poll() is None:
-            tts_proc.terminate()
+            try:
+                tts_proc.terminate()
+            except Exception:
+                pass
 
         tts_proc = subprocess.Popen(
             [TTS_ENGINE, "-v", TTS_VOICE, "-s", str(TTS_RATE), text],
@@ -273,14 +286,18 @@ def speak(text):
 
 
 def interrupt():
-    cancel_turn.set()
+    """Cancel current turn and stop any active TTS."""
     global tts_proc
+    cancel_turn.set()
 
     with tts_lock:
         if tts_proc and tts_proc.poll() is None:
-            tts_proc.terminate()
+            try:
+                tts_proc.terminate()
+            except Exception:
+                pass
 
-    print("(interrupted)")
+    print("interrupted", flush=True)
 
 
 # ----------------------------
@@ -297,9 +314,7 @@ device = InputDevice(DEVICE_PATH)
 
 is_recording = False
 stop_event = None
-audio = None
 active_route = None
-
 
 try:
     for event in device.read_loop():
@@ -307,44 +322,59 @@ try:
         if event.type != ecodes.EV_KEY:
             continue
 
+        # Interrupt (press)
         if event.code == INTERRUPT_KEY and event.value == 1:
             interrupt()
             continue
 
+        # PTT keys (red/green)
         if event.code in (RED_KEY, GREEN_KEY):
 
-            if event.value == 1:  # press
+            # PRESS
+            if event.value == 1:
                 cancel_turn.clear()
                 is_recording = True
                 stop_event = threading.Event()
 
-                active_route = ROUTES["red"] if event.code == RED_KEY else ROUTES["green"]
+                is_red = (event.code == RED_KEY)
+                active_route = ROUTES["red"] if is_red else ROUTES["green"]
+
+                label = "openai" if is_red else "local"
+                print(f"recording ({label})...", flush=True)
 
                 def runner():
-                    global audio
-                    audio = record_audio(stop_event)
+                    global audio_buffer
+                    audio_buffer = record_audio(stop_event)
 
-                threading.Thread(target=runner, daemon=True).start()
+                record_thread = threading.Thread(target=runner, daemon=True)
+                record_thread.start()
 
-            elif event.value == 0 and is_recording:  # release
+            # RELEASE
+            elif event.value == 0 and is_recording:
                 is_recording = False
-                stop_event.set()
 
-                text = transcribe(audio)
+                if stop_event:
+                    stop_event.set()
+
+                # wait for recording to finish
+                if record_thread:
+                    record_thread.join(timeout=2.0)
+
+                text = transcribe(audio_buffer)
                 if not text:
                     continue
 
-                print("\nYou:", text)
+                print("\nYou:", text, flush=True)
 
                 reply, backend = generate(text, active_route)
 
+                # If user hit interrupt during thinking, ignore the reply
                 if cancel_turn.is_set():
-                    print("(cancelled turn — ignoring reply)")
+                    print("(cancelled turn — ignoring reply)", flush=True)
                     continue
 
-                print(f"Assistant ({backend}): {reply}\n")
-
+                print(f"Assistant ({backend}): {reply}\n", flush=True)
                 speak(reply)
 
 except KeyboardInterrupt:
-    print("\nExiting...")
+    print("\nExiting...", flush=True)

@@ -1,8 +1,11 @@
 {
+
   "buttons": {
     "red_ptt": "BTN_THUMB",
-    "green_ptt": "BTN_TOP"
+    "green_ptt": "BTN_TOP",
+    "interrupt": "BTN_PINKIE"
   },
+
   "routes": {
     "red": {
       "backend": "openai",
