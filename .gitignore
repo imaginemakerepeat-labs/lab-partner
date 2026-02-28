@@ -1,15 +1,33 @@
+# ----------------------------
 # Environment files
+# ----------------------------
 .env
 *.env
 
+# ----------------------------
 # Python
+# ----------------------------
 venv/
 __pycache__/
 *.pyc
 
+# ----------------------------
 # OS
+# ----------------------------
 .DS_Store
 ._*
 
+# ----------------------------
 # Logs
+# ----------------------------
 logs/
+
+# ----------------------------
+# Runtime Memory (DO NOT COMMIT)
+# ----------------------------
+persona.txt
+knowledge_base.txt
+
+# (Keep these tracked)
+# persona.txt.example
+# knowledge_base.txt.example
