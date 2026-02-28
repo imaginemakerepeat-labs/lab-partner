@@ -8,6 +8,10 @@ Yellow/Interrupt = BTN_PINKIE (press to interrupt speech + cancel current turn)
 Notes:
 - Prints "recording (openai)..." / "recording (local)..." when PTT is pressed
 - Prints "interrupted" when interrupt is pressed
+
+Feature (OpenAI tool):
+- Adds a local tool get_time_date() so you don't have to anticipate phrasing.
+  The model can call it whenever the user asks for time/date/day.
 """
 
 import os
@@ -16,6 +20,7 @@ import tempfile
 import subprocess
 import threading
 from pathlib import Path
+from datetime import datetime
 
 import requests
 import numpy as np
@@ -157,6 +162,40 @@ audio_buffer = None
 
 
 # ----------------------------
+# LOCAL TOOL(S) FOR OPENAI
+# ----------------------------
+
+def tool_get_time_date() -> str:
+    """
+    Return local date/time from this device (Pi).
+    Keep it factual; the model can format further if it wants.
+    """
+    now = datetime.now()
+    # Slightly verbose but useful:
+    return now.strftime("%A, %B %d, %Y — %I:%M %p")
+
+
+OPENAI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_time_date",
+            "description": "Get the current local date and time on the device.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False
+            }
+        }
+    }
+]
+
+TOOL_DISPATCH = {
+    "get_time_date": lambda _args: tool_get_time_date()
+}
+
+
+# ----------------------------
 # AUDIO
 # ----------------------------
 
@@ -203,30 +242,100 @@ def transcribe(audio) -> str:
 # ----------------------------
 
 def _trim():
+    """
+    Trim conversation to last MAX_TURNS messages.
+    Note: tool messages count too. Keep MAX_TURNS reasonably sized.
+    """
     global messages
-    messages = messages[-MAX_TURNS:]
+    if MAX_TURNS and len(messages) > MAX_TURNS:
+        messages = messages[-MAX_TURNS:]
 
 
 def chat_openai(text: str, model: str) -> str:
+    """
+    OpenAI chat with tool calling. The model can call get_time_date() when needed.
+    """
     messages.append({"role": "user", "content": text})
     _trim()
 
-    resp = client.chat.completions.create(
-        model=model,
-        messages=messages
-    )
+    # We allow a short tool-call loop:
+    # 1) model may respond with tool_calls
+    # 2) we execute them, append tool results
+    # 3) call model again to get final assistant text
+    for _step in range(4):  # safety cap
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=OPENAI_TOOLS,
+            tool_choice="auto",
+        )
 
-    reply = (resp.choices[0].message.content or "").strip()
-    messages.append({"role": "assistant", "content": reply})
-    _trim()
-    return reply
+        msg = resp.choices[0].message
+
+        # If the model produced tool calls, execute them
+        tool_calls = getattr(msg, "tool_calls", None)
+        if tool_calls:
+            # Record the assistant message that initiated the tool call (content may be None)
+            messages.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": tc.type,
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in tool_calls
+                ]
+            })
+            _trim()
+
+            # Execute each tool call and append tool result messages
+            for tc in tool_calls:
+                name = tc.function.name
+                args_raw = tc.function.arguments or "{}"
+                try:
+                    args = json.loads(args_raw)
+                except Exception:
+                    args = {}
+
+                handler = TOOL_DISPATCH.get(name)
+                if not handler:
+                    tool_out = f"Tool '{name}' not implemented."
+                else:
+                    try:
+                        tool_out = handler(args)
+                    except Exception as e:
+                        tool_out = f"Tool '{name}' error: {e}"
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": str(tool_out),
+                })
+                _trim()
+
+            # loop again so the model can produce a final natural response
+            continue
+
+        # No tool calls: normal assistant message
+        reply = (msg.content or "").strip()
+        messages.append({"role": "assistant", "content": reply})
+        _trim()
+        return reply
+
+    # If we somehow hit the cap, fall back gracefully
+    return "Sorry — I got stuck while handling that request."
 
 
 def _local_prompt() -> str:
     lines = ["You are Lab Partner, a concise workshop assistant.\n"]
     for m in messages[-LOCAL_TURNS:]:
         role = "User" if m["role"] == "user" else "Assistant"
-        lines.append(f"{role}: {m['content']}")
+        # skip tool role in local prompt to avoid confusing smaller models
+        if m.get("role") == "tool":
+            continue
+        lines.append(f"{role}: {m.get('content','')}")
     lines.append("Assistant:")
     return "\n".join(lines)
 

@@ -4,3 +4,4 @@ numpy>=1.23.0
 sounddevice>=0.4.6
 soundfile>=0.12.1
 evdev>=1.6.1
+requests    
