@@ -7,11 +7,14 @@ Yellow/Interrupt = BTN_PINKIE (press to interrupt speech + cancel current turn)
 
 Features:
 - OpenAI tool: get_time_date()
-- Shared SYSTEM_PERSONA for OpenAI + Ollama
+- Shared persona + knowledge base loaded from local files
+- Voice commands to update persona/knowledge base (no LLM needed)
+- Runtime persona.txt / knowledge_base.txt are ignored by git; .example templates are committed
 """
 
 import os
 import json
+import shutil
 import tempfile
 import subprocess
 import threading
@@ -34,57 +37,40 @@ from evdev import InputDevice, ecodes
 DEFAULT_CONFIG = {
     "device_path": "/dev/input/by-id/usb-0079_USB_Gamepad-event-joystick",
     "sample_rate": 16000,
-
-    "models": {
-        "stt": "whisper-1",
-        "chat": "gpt-4o"
-    },
-
-    "tts": {
-        "engine": "espeak-ng",
-        "voice": "en-us",
-        "rate": 175
-    },
-
-    "logging": {
-        "enabled": True,
-        "path": "logs/conversation.jsonl",
-        "max_turns_in_memory": 12
-    },
-
-    "context": {
-        "local_turns": 6
-    },
-
+    "models": {"stt": "whisper-1", "chat": "gpt-4o"},
+    "tts": {"engine": "espeak-ng", "voice": "en-us", "rate": 175},
+    "logging": {"enabled": True, "path": "logs/conversation.jsonl", "max_turns_in_memory": 12},
+    "context": {"local_turns": 6},
     "buttons": {
         "red_ptt": "BTN_THUMB",
         "green_ptt": "BTN_TOP",
-        "interrupt": "BTN_PINKIE"
+        "interrupt": "BTN_PINKIE",
     },
-
     "routes": {
-        "red": {
-            "backend": "openai",
-            "chat_model": "gpt-4o"
-        },
-        "green": {
-            "backend": "ollama",
-            "ollama_model": "qwen2.5:1.5b-instruct"
-        }
-    }
+        "red": {"backend": "openai", "chat_model": "gpt-4o"},
+        "green": {"backend": "ollama", "ollama_model": "qwen2.5:1.5b-instruct"},
+    },
 }
 
 
 # ----------------------------
-# SYSTEM PERSONA
+# PERSISTED PERSONA + KB FILES
 # ----------------------------
 
-SYSTEM_PERSONA = (
+PERSONA_PATH = Path("persona.txt")
+KB_PATH = Path("knowledge_base.txt")
+
+PERSONA_EXAMPLE = Path("persona.txt.example")
+KB_EXAMPLE = Path("knowledge_base.txt.example")
+
+BASE_PERSONA = (
     "You are Lab Partner, a concise workshop assistant. "
     "You help with electronics, fabrication, coding, and practical problem solving. "
     "Be direct. Be clear. Avoid unnecessary verbosity."
-    "Your name is Query."
 )
+
+SYSTEM_PERSONA = BASE_PERSONA
+KNOWLEDGE_BASE = ""
 
 
 # ----------------------------
@@ -119,8 +105,91 @@ def load_config(path="config.json"):
     config["red_key"] = _ecode(buttons["red_ptt"])
     config["green_key"] = _ecode(buttons["green_ptt"])
     config["interrupt_key"] = _ecode(buttons["interrupt"])
-
     return config
+
+
+# ----------------------------
+# PERSONA + KB LOAD/SAVE
+# ----------------------------
+
+persona_lock = threading.Lock()
+kb_lock = threading.Lock()
+
+
+def _ensure_from_example(real_path: Path, example_path: Path, fallback_text: str):
+    """
+    If real_path doesn't exist, create it from example_path if present,
+    otherwise create it from fallback_text.
+    """
+    if real_path.exists():
+        return
+    if example_path.exists():
+        shutil.copyfile(example_path, real_path)    
+    else:
+        real_path.write_text((fallback_text or "").strip() + "\n", encoding="utf-8")
+
+
+def load_persona_and_kb():
+    global SYSTEM_PERSONA, KNOWLEDGE_BASE
+
+    _ensure_from_example(PERSONA_PATH, PERSONA_EXAMPLE, BASE_PERSONA)
+    _ensure_from_example(KB_PATH, KB_EXAMPLE, "")
+
+    txt = PERSONA_PATH.read_text(encoding="utf-8").strip()
+    if txt:
+        SYSTEM_PERSONA = txt
+
+    txt = KB_PATH.read_text(encoding="utf-8").strip()
+    KNOWLEDGE_BASE = txt
+
+
+def save_persona():
+    with persona_lock:
+        PERSONA_PATH.write_text((SYSTEM_PERSONA or "").strip() + "\n", encoding="utf-8")
+
+
+def append_persona(extra: str):
+    global SYSTEM_PERSONA
+    extra = (extra or "").strip()
+    if not extra:
+        return
+
+    with persona_lock:
+        # Avoid duplicates
+        if extra.lower() in (SYSTEM_PERSONA or "").lower():
+            return
+        SYSTEM_PERSONA = (SYSTEM_PERSONA or BASE_PERSONA).rstrip() + "\n- " + extra
+        save_persona()
+
+
+def save_kb():
+    with kb_lock:
+        KB_PATH.write_text((KNOWLEDGE_BASE or "").strip() + "\n", encoding="utf-8")
+
+
+def append_kb(extra: str):
+    global KNOWLEDGE_BASE
+    extra = (extra or "").strip()
+    if not extra:
+        return
+
+    with kb_lock:
+        # Avoid duplicates (case-insensitive)
+        if extra.lower() in (KNOWLEDGE_BASE or "").lower():
+            return
+
+        if not (KNOWLEDGE_BASE or "").strip():
+            KNOWLEDGE_BASE = extra
+        else:
+            KNOWLEDGE_BASE = KNOWLEDGE_BASE.rstrip() + "\n" + extra
+        save_kb()
+
+
+def clear_kb():
+    global KNOWLEDGE_BASE
+    with kb_lock:
+        KNOWLEDGE_BASE = ""
+        save_kb()
 
 
 # ----------------------------
@@ -141,7 +210,6 @@ GREEN_KEY = cfg["green_key"]
 INTERRUPT_KEY = cfg["interrupt_key"]
 
 ROUTES = cfg["routes"]
-
 MAX_TURNS = cfg["logging"]["max_turns_in_memory"]
 
 TTS_ENGINE = cfg["tts"]["engine"]
@@ -156,6 +224,8 @@ tts_lock = threading.Lock()
 
 record_thread = None
 audio_buffer = None
+
+load_persona_and_kb()
 
 
 # ----------------------------
@@ -173,18 +243,96 @@ OPENAI_TOOLS = [
         "function": {
             "name": "get_time_date",
             "description": "Get the current local date and time.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": False
-            }
-        }
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
     }
 ]
 
 TOOL_DISPATCH = {
     "get_time_date": lambda _args: tool_get_time_date()
 }
+
+
+# ----------------------------
+# VOICE COMMAND ROUTER (PERSONA/KB)
+# ----------------------------
+
+def maybe_handle_voice_memory(text: str) -> str | None:
+    """
+    Intercept voice commands that update persona/KB.
+    Supports commands appearing anywhere in the sentence:
+
+    Examples:
+      - "Add to knowledge base: The Wi-Fi is Fry Shack"
+      - "The Wi-Fi is Fry Shack, add that to your knowledge base"
+      - "Always be concise; add to persona"
+    """
+    if not text:
+        return None
+
+    t = text.strip()
+    tl = t.lower()
+
+    # Show commands
+    if tl in ("show persona", "read persona"):
+        if not (SYSTEM_PERSONA or "").strip():
+            return "Persona is empty."
+        # Keep TTS short; user can open persona.txt for full text
+        return "Persona loaded. Check persona.txt."
+
+    if tl in ("show knowledge base", "show knowledge", "show kb", "read kb", "read knowledge base"):
+        if not (KNOWLEDGE_BASE or "").strip():
+            return "Knowledge base is empty."
+        return "Knowledge base loaded. Check knowledge_base.txt."
+
+    # Clear KB
+    if tl in ("clear kb", "clear knowledge base", "clear knowledge"):
+        clear_kb()
+        return "Cleared the knowledge base."
+
+    # Add to persona (phrase anywhere)
+    if "add to persona" in tl:
+        idx = tl.find("add to persona")
+        payload = t[:idx].strip()
+        # allow "add to persona: <payload>" too
+        if not payload:
+            after = t[idx + len("add to persona"):].strip()
+            if after.startswith(":"):
+                after = after[1:].strip()
+            payload = after
+
+        if not payload:
+            return "Please say what to add to persona."
+        append_persona(payload)
+        return "Added to persona."
+
+    # Add to knowledge base / kb (phrase anywhere)
+    for phrase in ["add to knowledge base", "add to knowledge", "add to kb"]:
+        if phrase in tl:
+            idx = tl.find(phrase)
+            payload = t[:idx].strip()
+            if not payload:
+                after = t[idx + len(phrase):].strip()
+                if after.startswith(":"):
+                    after = after[1:].strip()
+                payload = after
+
+            if not payload:
+                return "Please say what to add to the knowledge base."
+            append_kb(payload)
+            return "Added to knowledge base."
+
+    # Optional: "remember this: ..." convenience
+    if tl.startswith("remember this"):
+        payload = t[len("remember this"):].strip()
+        if payload.startswith(":"):
+            payload = payload[1:].strip()
+        if payload:
+            append_kb(payload)
+            return "Added to knowledge base."
+        return "Please say what to remember."
+
+    return None
 
 
 # ----------------------------
@@ -239,10 +387,16 @@ def _trim():
         messages = messages[-MAX_TURNS:]
 
 
+def _system_context_block() -> str:
+    if (KNOWLEDGE_BASE or "").strip():
+        return (SYSTEM_PERSONA or BASE_PERSONA).strip() + "\n\nKnowledge base:\n" + KNOWLEDGE_BASE.strip()
+    return (SYSTEM_PERSONA or BASE_PERSONA).strip()
+
+
 def chat_openai(text: str, model: str) -> str:
-    # Inject system persona once
+    # Inject system message once
     if not any(m["role"] == "system" for m in messages):
-        messages.append({"role": "system", "content": SYSTEM_PERSONA})
+        messages.append({"role": "system", "content": _system_context_block()})
 
     messages.append({"role": "user", "content": text})
     _trim()
@@ -266,34 +420,26 @@ def chat_openai(text: str, model: str) -> str:
                     {
                         "id": tc.id,
                         "type": tc.type,
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        },
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
                     }
                     for tc in tool_calls
-                ]
+                ],
             })
             _trim()
 
             for tc in tool_calls:
                 name = tc.function.name
-                args = {}
                 handler = TOOL_DISPATCH.get(name)
 
                 if handler:
                     try:
-                        tool_out = handler(args)
+                        tool_out = handler({})
                     except Exception as e:
                         tool_out = f"Tool error: {e}"
                 else:
                     tool_out = f"Unknown tool: {name}"
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": str(tool_out),
-                })
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(tool_out)})
                 _trim()
 
             continue
@@ -307,7 +453,7 @@ def chat_openai(text: str, model: str) -> str:
 
 
 def _local_prompt() -> str:
-    lines = [SYSTEM_PERSONA + "\n"]
+    lines = [_system_context_block() + "\n"]
     for m in messages[-LOCAL_TURNS:]:
         if m["role"] == "tool":
             continue
@@ -443,6 +589,16 @@ try:
                     continue
 
                 print("\nYou:", text, flush=True)
+
+                # Voice memory commands take priority and DO NOT call LLM
+                local = maybe_handle_voice_memory(text)
+                if local:
+                    if cancel_turn.is_set():
+                        print("(cancelled turn — ignoring local action)", flush=True)
+                        continue
+                    print(f"Assistant (local): {local}\n", flush=True)
+                    speak(local)
+                    continue
 
                 reply, backend = generate(text, active_route)
 
