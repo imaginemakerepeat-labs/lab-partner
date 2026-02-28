@@ -5,13 +5,9 @@ Red   = OpenAI (PTT hold)
 Green = Ollama (PTT hold)
 Yellow/Interrupt = BTN_PINKIE (press to interrupt speech + cancel current turn)
 
-Notes:
-- Prints "recording (openai)..." / "recording (local)..." when PTT is pressed
-- Prints "interrupted" when interrupt is pressed
-
-Feature (OpenAI tool):
-- Adds a local tool get_time_date() so you don't have to anticipate phrasing.
-  The model can call it whenever the user asks for time/date/day.
+Features:
+- OpenAI tool: get_time_date()
+- Shared SYSTEM_PERSONA for OpenAI + Ollama
 """
 
 import os
@@ -63,7 +59,6 @@ DEFAULT_CONFIG = {
     "buttons": {
         "red_ptt": "BTN_THUMB",
         "green_ptt": "BTN_TOP",
-        # IMPORTANT: your evtest shows interrupt is BTN_PINKIE (code 293)
         "interrupt": "BTN_PINKIE"
     },
 
@@ -78,6 +73,18 @@ DEFAULT_CONFIG = {
         }
     }
 }
+
+
+# ----------------------------
+# SYSTEM PERSONA
+# ----------------------------
+
+SYSTEM_PERSONA = (
+    "You are Lab Partner, a concise workshop assistant. "
+    "You help with electronics, fabrication, coding, and practical problem solving. "
+    "Be direct. Be clear. Avoid unnecessary verbosity."
+    "Your name is Query."
+)
 
 
 # ----------------------------
@@ -96,7 +103,7 @@ def _deep_merge(base, override):
 
 def _ecode(name: str) -> int:
     if not hasattr(ecodes, name):
-        raise ValueError(f"Unknown button '{name}' (not in evdev.ecodes)")
+        raise ValueError(f"Unknown button '{name}'")
     return getattr(ecodes, name)
 
 
@@ -114,13 +121,6 @@ def load_config(path="config.json"):
     config["interrupt_key"] = _ecode(buttons["interrupt"])
 
     return config
-
-
-def append_jsonl(path, obj):
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(obj) + "\n")
 
 
 # ----------------------------
@@ -142,8 +142,6 @@ INTERRUPT_KEY = cfg["interrupt_key"]
 
 ROUTES = cfg["routes"]
 
-LOG_ENABLED = cfg["logging"]["enabled"]
-LOG_PATH = cfg["logging"]["path"]
 MAX_TURNS = cfg["logging"]["max_turns_in_memory"]
 
 TTS_ENGINE = cfg["tts"]["engine"]
@@ -152,7 +150,6 @@ TTS_RATE = cfg["tts"]["rate"]
 
 messages = []
 
-# interrupt + recording control
 cancel_turn = threading.Event()
 tts_proc = None
 tts_lock = threading.Lock()
@@ -162,16 +159,11 @@ audio_buffer = None
 
 
 # ----------------------------
-# LOCAL TOOL(S) FOR OPENAI
+# LOCAL TOOL (OpenAI)
 # ----------------------------
 
 def tool_get_time_date() -> str:
-    """
-    Return local date/time from this device (Pi).
-    Keep it factual; the model can format further if it wants.
-    """
     now = datetime.now()
-    # Slightly verbose but useful:
     return now.strftime("%A, %B %d, %Y — %I:%M %p")
 
 
@@ -180,7 +172,7 @@ OPENAI_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_time_date",
-            "description": "Get the current local date and time on the device.",
+            "description": "Get the current local date and time.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -242,27 +234,20 @@ def transcribe(audio) -> str:
 # ----------------------------
 
 def _trim():
-    """
-    Trim conversation to last MAX_TURNS messages.
-    Note: tool messages count too. Keep MAX_TURNS reasonably sized.
-    """
     global messages
     if MAX_TURNS and len(messages) > MAX_TURNS:
         messages = messages[-MAX_TURNS:]
 
 
 def chat_openai(text: str, model: str) -> str:
-    """
-    OpenAI chat with tool calling. The model can call get_time_date() when needed.
-    """
+    # Inject system persona once
+    if not any(m["role"] == "system" for m in messages):
+        messages.append({"role": "system", "content": SYSTEM_PERSONA})
+
     messages.append({"role": "user", "content": text})
     _trim()
 
-    # We allow a short tool-call loop:
-    # 1) model may respond with tool_calls
-    # 2) we execute them, append tool results
-    # 3) call model again to get final assistant text
-    for _step in range(4):  # safety cap
+    for _ in range(4):
         resp = client.chat.completions.create(
             model=model,
             messages=messages,
@@ -271,11 +256,9 @@ def chat_openai(text: str, model: str) -> str:
         )
 
         msg = resp.choices[0].message
-
-        # If the model produced tool calls, execute them
         tool_calls = getattr(msg, "tool_calls", None)
+
         if tool_calls:
-            # Record the assistant message that initiated the tool call (content may be None)
             messages.append({
                 "role": "assistant",
                 "content": msg.content or "",
@@ -283,30 +266,28 @@ def chat_openai(text: str, model: str) -> str:
                     {
                         "id": tc.id,
                         "type": tc.type,
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        },
                     }
                     for tc in tool_calls
                 ]
             })
             _trim()
 
-            # Execute each tool call and append tool result messages
             for tc in tool_calls:
                 name = tc.function.name
-                args_raw = tc.function.arguments or "{}"
-                try:
-                    args = json.loads(args_raw)
-                except Exception:
-                    args = {}
-
+                args = {}
                 handler = TOOL_DISPATCH.get(name)
-                if not handler:
-                    tool_out = f"Tool '{name}' not implemented."
-                else:
+
+                if handler:
                     try:
                         tool_out = handler(args)
                     except Exception as e:
-                        tool_out = f"Tool '{name}' error: {e}"
+                        tool_out = f"Tool error: {e}"
+                else:
+                    tool_out = f"Unknown tool: {name}"
 
                 messages.append({
                     "role": "tool",
@@ -315,26 +296,22 @@ def chat_openai(text: str, model: str) -> str:
                 })
                 _trim()
 
-            # loop again so the model can produce a final natural response
             continue
 
-        # No tool calls: normal assistant message
         reply = (msg.content or "").strip()
         messages.append({"role": "assistant", "content": reply})
         _trim()
         return reply
 
-    # If we somehow hit the cap, fall back gracefully
-    return "Sorry — I got stuck while handling that request."
+    return "Sorry — I got stuck."
 
 
 def _local_prompt() -> str:
-    lines = ["You are Lab Partner, a concise workshop assistant.\n"]
+    lines = [SYSTEM_PERSONA + "\n"]
     for m in messages[-LOCAL_TURNS:]:
-        role = "User" if m["role"] == "user" else "Assistant"
-        # skip tool role in local prompt to avoid confusing smaller models
-        if m.get("role") == "tool":
+        if m["role"] == "tool":
             continue
+        role = "User" if m["role"] == "user" else "Assistant"
         lines.append(f"{role}: {m.get('content','')}")
     lines.append("Assistant:")
     return "\n".join(lines)
@@ -370,17 +347,15 @@ def generate(text: str, route: dict):
 
 
 # ----------------------------
-# INTERRUPTIBLE SPEECH
+# SPEECH
 # ----------------------------
 
 def speak(text: str):
-    """Start TTS; if already speaking, stop and replace."""
     global tts_proc
     if not text:
         return
 
     with tts_lock:
-        # stop any currently-speaking process
         if tts_proc and tts_proc.poll() is None:
             try:
                 tts_proc.terminate()
@@ -395,7 +370,6 @@ def speak(text: str):
 
 
 def interrupt():
-    """Cancel current turn and stop any active TTS."""
     global tts_proc
     cancel_turn.set()
 
@@ -431,15 +405,12 @@ try:
         if event.type != ecodes.EV_KEY:
             continue
 
-        # Interrupt (press)
         if event.code == INTERRUPT_KEY and event.value == 1:
             interrupt()
             continue
 
-        # PTT keys (red/green)
         if event.code in (RED_KEY, GREEN_KEY):
 
-            # PRESS
             if event.value == 1:
                 cancel_turn.clear()
                 is_recording = True
@@ -458,14 +429,12 @@ try:
                 record_thread = threading.Thread(target=runner, daemon=True)
                 record_thread.start()
 
-            # RELEASE
             elif event.value == 0 and is_recording:
                 is_recording = False
 
                 if stop_event:
                     stop_event.set()
 
-                # wait for recording to finish
                 if record_thread:
                     record_thread.join(timeout=2.0)
 
@@ -477,7 +446,6 @@ try:
 
                 reply, backend = generate(text, active_route)
 
-                # If user hit interrupt during thinking, ignore the reply
                 if cancel_turn.is_set():
                     print("(cancelled turn — ignoring reply)", flush=True)
                     continue
