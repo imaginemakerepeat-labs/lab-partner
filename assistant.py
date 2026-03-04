@@ -1,53 +1,48 @@
 #!/usr/bin/env python3
 """
-Lab Partner — Dual PTT + Interrupt + Pygame HUD + Persona/KB (single-file, spawn-safe)
+Lab Partner — Dual PTT + Interrupt + HUD + Persona/KB + Keyboard + Maynard Mouth (Debug)
 
-Red   = OpenAI (PTT hold)
-Green = Ollama (PTT hold)
-Yellow/Interrupt = BTN_PINKIE (press to interrupt speech + cancel current turn)
+Gamepad:
+- Red   = OpenAI (hold to record)
+- Green = Local/Ollama (hold to record)
+- Yellow/Interrupt = BTN_PINKIE (press to interrupt TTS + cancel current turn)
 
-Files in repo root (same folder as assistant.py):
-- persona.txt
-- knowledge_base.txt
+Keyboard (toggle mode; type then Enter):
+- o  -> toggle OpenAI record start/stop
+- l  -> toggle Local/Ollama record start/stop
+- i  -> interrupt
+- h  -> help
+- q  -> quit
 
 HUD:
-- Optional pygame window in a separate process (spawn-safe)
-- Updates on recording/thinking/speaking/interrupt/idle
-- If pygame fails to start, assistant still runs normally
+- Uses hud.py's run_hud(queue)
+
+Persona/Knowledge:
+- Loads persona.txt and knowledge_base.txt if present; injects into system prompt.
+
+Maynard mouth:
+- Sends 'open'/'wide'/'close'/'clear' over UDP to Maynard.
+- DEBUG format: "seq|timestamp|cmd"
+- Prints sender-side logs so we can pinpoint cut-outs.
 """
 
-import os
+import sys
 import json
 import time
+import socket
 import tempfile
 import subprocess
 import threading
 from pathlib import Path
-import multiprocessing as mp
+from queue import Queue, Empty
 
 import requests
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from dotenv import load_dotenv
-from openai import OpenAI, BadRequestError
+from openai import OpenAI
 from evdev import InputDevice, ecodes
-
-
-# ----------------------------
-# PERSONA / KNOWLEDGE BASE
-# ----------------------------
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-
-
-def read_text_file(name: str) -> str:
-    p = SCRIPT_DIR / name
-    try:
-        return p.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        print(f"Warning: {name} not found in {SCRIPT_DIR}", flush=True)
-        return ""
 
 
 # ----------------------------
@@ -57,35 +52,24 @@ def read_text_file(name: str) -> str:
 DEFAULT_CONFIG = {
     "device_path": "/dev/input/by-id/usb-0079_USB_Gamepad-event-joystick",
     "sample_rate": 16000,
-    "models": {
-        "stt": "whisper-1",
-        "chat": "gpt-4o",
-    },
-    "tts": {
-        "engine": "espeak-ng",
-        "voice": "en-us",
-        "rate": 175,
-    },
-    "logging": {
-        "enabled": True,
-        "path": "logs/conversation.jsonl",
-        "max_turns_in_memory": 12,  # messages kept (not "turns")
-    },
-    "context": {
-        "local_turns": 6,
-    },
-    "buttons": {
-        "red_ptt": "BTN_THUMB",
-        "green_ptt": "BTN_TOP",
-        "interrupt": "BTN_PINKIE",
-    },
+    "models": {"stt": "whisper-1", "chat": "gpt-4o"},
+    "tts": {"engine": "espeak-ng", "voice": "en-us", "rate": 175},
+    "logging": {"enabled": True, "path": "logs/conversation.jsonl", "max_turns_in_memory": 12},
+    "context": {"local_turns": 6},
+    "buttons": {"red_ptt": "BTN_THUMB", "green_ptt": "BTN_TOP", "interrupt": "BTN_PINKIE"},
     "routes": {
         "red": {"backend": "openai", "chat_model": "gpt-4o"},
         "green": {"backend": "ollama", "ollama_model": "qwen2.5:1.5b-instruct"},
     },
-    "hud": {"enabled": True},
+    "ollama": {"url": "http://127.0.0.1:11434/api/chat"},
+    "maynard": {"enabled": True, "ip": "10.0.0.4", "port": 9000},
+    "prompt_files": {"persona": "persona.txt", "knowledge_base": "knowledge_base.txt"},
 }
 
+
+# ----------------------------
+# CONFIG HELPERS
+# ----------------------------
 
 def _deep_merge(base, override):
     result = dict(base)
@@ -99,299 +83,266 @@ def _deep_merge(base, override):
 
 def _ecode(name: str) -> int:
     if not hasattr(ecodes, name):
-        raise ValueError(f"Unknown button '{name}' (not in evdev.ecodes)")
+        raise ValueError(f"Unknown evdev code name: {name}")
     return getattr(ecodes, name)
 
 
-def load_config(path="config.json"):
-    config = dict(DEFAULT_CONFIG)
-    p = Path(path)
+def load_config() -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    p = Path("config.json")
     if p.exists():
-        with p.open("r", encoding="utf-8") as f:
-            config = _deep_merge(config, json.load(f))
+        try:
+            cfg = _deep_merge(cfg, json.loads(p.read_text(encoding="utf-8")))
+        except Exception as e:
+            print(f"⚠️ Failed to load config.json: {e}", flush=True)
+    cfg["red_key"] = _ecode(cfg["buttons"]["red_ptt"])
+    cfg["green_key"] = _ecode(cfg["buttons"]["green_ptt"])
+    cfg["interrupt_key"] = _ecode(cfg["buttons"]["interrupt"])
+    return cfg
 
-    buttons = config["buttons"]
-    config["red_key"] = _ecode(buttons["red_ptt"])
-    config["green_key"] = _ecode(buttons["green_ptt"])
-    config["interrupt_key"] = _ecode(buttons["interrupt"])
-    return config
 
-
-def append_jsonl(path, obj):
+def append_jsonl(path: str, obj: dict) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("a", encoding="utf-8") as f:
         f.write(json.dumps(obj) + "\n")
 
 
-# ----------------------------
-# HUD (pygame in separate process)
-# ----------------------------
-
-HUD_STATE_IDLE = "IDLE"
-HUD_STATE_RECORDING = "RECORDING"
-HUD_STATE_THINKING = "THINKING"
-HUD_STATE_SPEAKING = "SPEAKING"
-HUD_STATE_INTERRUPTED = "INTERRUPTED"
-
-HUD_BACKEND_OPENAI = "OPENAI"
-HUD_BACKEND_LOCAL = "LOCAL"
-
-HUD_ENABLED = True
-hud_q = None
-hud_proc = None
-
-
-def _hud_color_for(state, backend):
-    if state == HUD_STATE_IDLE:
-        return (35, 35, 40)
-    if state == HUD_STATE_RECORDING:
-        return (120, 35, 35) if backend == HUD_BACKEND_OPENAI else (35, 120, 55)
-    if state == HUD_STATE_THINKING:
-        return (35, 65, 120)
-    if state == HUD_STATE_SPEAKING:
-        return (90, 45, 120)
-    if state == HUD_STATE_INTERRUPTED:
-        return (140, 120, 35)
-    return (35, 35, 40)
-
-
-def _hud_badge_color(backend):
-    if backend == HUD_BACKEND_OPENAI:
-        return (220, 80, 80)
-    if backend == HUD_BACKEND_LOCAL:
-        return (80, 220, 120)
-    return (160, 160, 160)
-
-
-def run_hud(queue):
-    """
-    Runs in a separate process.
-    Receives dict messages:
-      {"backend": "OPENAI"/"LOCAL", "state": "...", "status": "...", "memory": int, "flash": bool}
-    Special:
-      {"cmd": "quit"} exits.
-    """
+def read_text_file(path: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        return ""
     try:
-        import pygame
+        return p.read_text(encoding="utf-8").strip()
     except Exception:
-        return
-
-    pygame.init()
-    screen = pygame.display.set_mode((520, 240))
-    pygame.display.set_caption("Lab Partner HUD")
-    clock = pygame.time.Clock()
-
-    font_title = pygame.font.SysFont(None, 34)
-    font_body = pygame.font.SysFont(None, 24)
-    font_small = pygame.font.SysFont(None, 18)
-
-    backend = HUD_BACKEND_OPENAI
-    state = HUD_STATE_IDLE
-    memory_turns = 0
-    status_line = "Idle / Ready"
-    flash_until = 0.0
-
-    running = True
-    while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-
-        while True:
-            try:
-                msg = queue.get_nowait()
-            except Exception:
-                break
-
-            if isinstance(msg, dict) and msg.get("cmd") == "quit":
-                running = False
-                break
-
-            if not isinstance(msg, dict):
-                continue
-
-            if msg.get("backend") is not None:
-                backend = msg["backend"]
-            if msg.get("state") is not None:
-                state = msg["state"]
-            if msg.get("status") is not None:
-                status_line = msg["status"]
-            if msg.get("memory") is not None:
-                memory_turns = int(msg["memory"])
-            if msg.get("flash"):
-                flash_until = time.time() + 0.35
-
-        screen.fill(_hud_color_for(state, backend))
-
-        panel = pygame.Rect(18, 18, 484, 204)
-        pygame.draw.rect(screen, (15, 15, 18), panel, border_radius=16)
-        pygame.draw.rect(screen, (55, 55, 65), panel, width=2, border_radius=16)
-
-        title = font_title.render("LAB PARTNER — HUD", True, (235, 235, 240))
-        screen.blit(title, (34, 30))
-
-        badge_rect = pygame.Rect(360, 28, 126, 28)
-        pygame.draw.rect(screen, _hud_badge_color(backend), badge_rect, border_radius=10)
-        screen.blit(font_small.render(backend, True, (15, 15, 18)), (badge_rect.x + 12, badge_rect.y + 7))
-
-        screen.blit(font_body.render("STATE:", True, (200, 200, 210)), (34, 78))
-        screen.blit(font_body.render(state, True, (240, 240, 245)), (120, 78))
-
-        screen.blit(font_body.render("MEMORY:", True, (200, 200, 210)), (34, 110))
-        screen.blit(font_body.render(f"{memory_turns} turns", True, (240, 240, 245)), (120, 110))
-
-        status_box = pygame.Rect(34, 142, 452, 54)
-        pygame.draw.rect(screen, (25, 25, 30), status_box, border_radius=12)
-        pygame.draw.rect(screen, (70, 70, 85), status_box, width=2, border_radius=12)
-        screen.blit(font_body.render(status_line, True, (235, 235, 245)), (status_box.x + 14, status_box.y + 15))
-
-        screen.blit(font_small.render("Driven by assistant.py events", True, (170, 170, 185)), (34, 202))
-
-        if time.time() < flash_until:
-            overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
-            overlay.fill((255, 220, 80, 90))
-            screen.blit(overlay, (0, 0))
-
-        pygame.display.flip()
-        clock.tick(60)
-
-    pygame.quit()
+        return ""
 
 
-def hud_send(*, backend=None, state=None, status=None, memory=None, flash=False):
-    global hud_q, HUD_ENABLED
-    if not HUD_ENABLED or hud_q is None:
+# ----------------------------
+# INIT
+# ----------------------------
+
+load_dotenv()
+client = OpenAI()
+cfg = load_config()
+
+DEVICE_PATH = cfg["device_path"]
+SAMPLE_RATE = int(cfg["sample_rate"])
+
+STT_MODEL = cfg["models"]["stt"]
+OPENAI_CHAT_MODEL_DEFAULT = cfg["models"]["chat"]
+
+TTS_ENGINE = cfg["tts"]["engine"]
+TTS_VOICE = cfg["tts"]["voice"]
+TTS_RATE = str(cfg["tts"]["rate"])
+
+LOG_ENABLED = bool(cfg["logging"]["enabled"])
+LOG_PATH = cfg["logging"]["path"]
+MAX_TURNS = int(cfg["logging"]["max_turns_in_memory"])
+
+LOCAL_TURNS = int(cfg["context"]["local_turns"])
+
+RED_KEY = cfg["red_key"]
+GREEN_KEY = cfg["green_key"]
+INTERRUPT_KEY = cfg["interrupt_key"]
+
+ROUTES = cfg["routes"]
+OLLAMA_URL = cfg.get("ollama", {}).get("url", "http://127.0.0.1:11434/api/chat")
+
+MAYNARD_ENABLED = bool(cfg.get("maynard", {}).get("enabled", True))
+MAYNARD_IP = cfg.get("maynard", {}).get("ip", "10.0.0.4")
+MAYNARD_PORT = int(cfg.get("maynard", {}).get("port", 9000))
+
+PROMPT_PERSONA = cfg.get("prompt_files", {}).get("persona", "persona.txt")
+PROMPT_KB = cfg.get("prompt_files", {}).get("knowledge_base", "knowledge_base.txt")
+
+
+# ----------------------------
+# HUD (your hud.py uses run_hud(queue))
+# ----------------------------
+
+hud_queue = None
+hud_thread = None
+hud_mod = None
+
+def hud_put(payload: dict) -> None:
+    global hud_queue
+    if hud_queue is None:
         return
     try:
-        hud_q.put_nowait(
-            {
-                "backend": backend,
-                "state": state,
-                "status": status,
-                "memory": memory,
-                "flash": flash,
-            }
-        )
+        hud_queue.put_nowait(payload)
     except Exception:
         pass
 
+try:
+    import hud as hud_mod
+    hud_queue = Queue()
+    hud_thread = threading.Thread(target=hud_mod.run_hud, args=(hud_queue,), daemon=True)
+    hud_thread.start()
+    print("HUD started", flush=True)
+except Exception as e:
+    print(f"HUD not started: {e}", flush=True)
+    hud_queue = None
+    hud_mod = None
 
-def start_hud():
-    global hud_q, hud_proc, HUD_ENABLED
-    if not HUD_ENABLED:
-        return
-    try:
-        # IMPORTANT: must be called under __main__ guard
-        mp.set_start_method("spawn", force=True)
-        hud_q = mp.Queue()
-        hud_proc = mp.Process(target=run_hud, args=(hud_q,), daemon=True)
-        hud_proc.start()
-    except Exception as e:
-        print(f"HUD disabled (failed to start): {e}", flush=True)
-        HUD_ENABLED = False
+def hud_state(state: str, status: str = "", backend: str = "", flash: bool = False, memory: int = 0) -> None:
+    payload = {"state": state, "status": status, "flash": flash, "memory": memory}
+    if backend:
+        payload["backend"] = backend
+    hud_put(payload)
 
 
 # ----------------------------
-# GLOBALS (set in main)
+# PERSONA / KB SYSTEM PROMPT
 # ----------------------------
 
-client = None
-cfg = None
+persona_txt = read_text_file(PROMPT_PERSONA)
+kb_txt = read_text_file(PROMPT_KB)
 
-DEVICE_PATH = None
-SAMPLE_RATE = 16000
-LOCAL_TURNS = 6
+if persona_txt:
+    print(f"Loaded {PROMPT_PERSONA}: {len(persona_txt)} chars", flush=True)
+if kb_txt:
+    print(f"Loaded {PROMPT_KB}: {len(kb_txt)} chars", flush=True)
 
-RED_KEY = None
-GREEN_KEY = None
-INTERRUPT_KEY = None
-ROUTES = None
+system_prompt = "\n\n".join([t for t in [persona_txt, kb_txt] if t]).strip()
 
-LOG_ENABLED = True
-LOG_PATH = "logs/conversation.jsonl"
-MAX_TURNS = 12
 
-TTS_ENGINE = "espeak-ng"
-TTS_VOICE = "en-us"
-TTS_RATE = 175
-
-persona_text = ""
-kb_text = ""
+# ----------------------------
+# STATE
+# ----------------------------
 
 messages = []
+if system_prompt:
+    messages.append({"role": "system", "content": system_prompt})
 
-# interrupt + recording control
 cancel_turn = threading.Event()
 
-# TTS state
 tts_proc = None
 tts_lock = threading.Lock()
-_speak_token = 0
-_speak_token_lock = threading.Lock()
 
+is_recording = False
+active_route_key = None   # "red" or "green"
+stop_event = None
+rec_thread = None
+audio_holder = {"audio": np.array([], dtype=np.float32)}
 
-def get_turn_count() -> int:
-    """
-    Returns "turns" as user/assistant pairs, ignoring an initial system message.
-    """
+mouth_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+def trim_messages():
     if not messages:
-        return 0
-    usable = messages[1:] if messages and messages[0].get("role") == "system" else messages
-    return len(usable) // 2
+        return
+    sys_msg = messages[0] if messages[0]["role"] == "system" else None
+    rest = messages[1:] if sys_msg else messages
+    rest = rest[-(MAX_TURNS * 2):]
+    messages.clear()
+    if sys_msg:
+        messages.append(sys_msg)
+    messages.extend(rest)
 
+
+# ----------------------------
+# MAYNARD MOUTH DEBUG
+# ----------------------------
+
+MOUTH_DEBUG = True
+MOUTH_DEBUG_EVERY = 1   # print every N sends (1=all; set 10 to reduce spam)
+mouth_seq = 0
+mouth_sent = 0
+
+def maynard_send(cmd: str, why: str = "") -> None:
+    """Send UDP mouth command with seq/timestamp (for debug)."""
+    global mouth_seq, mouth_sent
+    if not MAYNARD_ENABLED:
+        return
+
+    mouth_seq += 1
+    mouth_sent += 1
+    payload = f"{mouth_seq}|{time.time():.3f}|{cmd}"
+
+    try:
+        mouth_sock.sendto(payload.encode("utf-8"), (MAYNARD_IP, MAYNARD_PORT))
+        if MOUTH_DEBUG and (mouth_sent % MOUTH_DEBUG_EVERY == 0):
+            print(f"[MOUTH->] seq={mouth_seq} cmd={cmd} why={why}", flush=True)
+    except Exception as e:
+        print(f"[MOUTH!!] send failed seq={mouth_seq} cmd={cmd} err={e}", flush=True)
+
+
+def _char_to_viseme(ch: str):
+    c = ch.lower()
+    if c in "mbp":
+        return "close"
+    if c in "ei":
+        return "wide"
+    if c in "aou":
+        return "open"
+    if c == "y":
+        return "wide"
+    return None
+
+
+def mouth_ticker_loop(stop_evt: threading.Event) -> None:
+    """
+    Loop animation while speaking:
+    Keeps sending packets until stop_evt or cancel_turn is set.
+    """
+    print("[MOUTH] loop start", flush=True)
+    cycle = ["open", "wide", "open", "close"]
+    idx = 0
+
+    try:
+        while not stop_evt.is_set() and not cancel_turn.is_set():
+            cmd = cycle[idx % len(cycle)]
+            maynard_send(cmd, why="loop")
+            idx += 1
+            time.sleep(0.08)  # ~12.5 fps; try 0.06 for snappier
+    except Exception as e:
+        print(f"[MOUTH!!] loop exception: {e}", flush=True)
+
+    maynard_send("close", why="loop_end")
+    maynard_send("clear", why="loop_end")
+    print("[MOUTH] loop end", flush=True)
 
 # ----------------------------
 # AUDIO
 # ----------------------------
 
-def record_audio(stop_event: threading.Event):
-    chunks = []
+def record_audio(stop_evt: threading.Event) -> np.ndarray:
+    frames = []
 
-    def callback(indata, frames, time_info, status):
-        chunks.append(indata.copy())
+    def callback(indata, frame_count, time_info, status):
+        frames.append(indata.copy())
+        if stop_evt.is_set():
+            raise sd.CallbackStop()
 
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=callback):
-        while not stop_event.is_set():
-            sd.sleep(50)
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=callback):
+            while not stop_evt.is_set():
+                sd.sleep(50)
+    except Exception:
+        return np.array([], dtype=np.float32)
 
-    if not chunks:
-        return np.zeros((0, 1), dtype=np.float32)
+    if not frames:
+        return np.array([], dtype=np.float32)
 
-    return np.concatenate(chunks, axis=0)
+    return np.concatenate(frames, axis=0).flatten().astype(np.float32)
 
 
-def transcribe(audio) -> str:
+def transcribe(audio: np.ndarray) -> str:
     if audio is None or getattr(audio, "size", 0) == 0:
         return ""
 
-    # Reject ultra-short audio locally to avoid API 400s
-    min_samples = int(0.10 * SAMPLE_RATE)
-    if getattr(audio, "shape", (0,))[0] < min_samples:
-        return ""
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        sf.write(tmp.name, audio, SAMPLE_RATE)
-        tmp_path = tmp.name
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        sf.write(f.name, audio, SAMPLE_RATE)
+        wav_path = f.name
 
     try:
-        with open(tmp_path, "rb") as f:
-            try:
-                resp = client.audio.transcriptions.create(
-                    model=cfg["models"]["stt"],
-                    file=f,
-                )
-            except BadRequestError as e:
-                # Common: "Audio file is too short"
-                msg = str(e)
-                if "audio_too_short" in msg or "too short" in msg:
-                    return ""
-                raise
+        with open(wav_path, "rb") as f:
+            resp = client.audio.transcriptions.create(model=STT_MODEL, file=f)
         return (resp.text or "").strip()
     finally:
         try:
-            os.unlink(tmp_path)
-        except FileNotFoundError:
+            Path(wav_path).unlink()
+        except Exception:
             pass
 
 
@@ -399,320 +350,359 @@ def transcribe(audio) -> str:
 # CHAT
 # ----------------------------
 
-def _trim():
-    global messages
-    messages = messages[-MAX_TURNS:]
+def chat_openai(user_text: str, model: str) -> str:
+    cancel_turn.clear()
+    messages.append({"role": "user", "content": user_text})
+    trim_messages()
+
+    resp = client.chat.completions.create(model=model, messages=messages)
+
+    if cancel_turn.is_set():
+        return ""
+
+    out = (resp.choices[0].message.content or "").strip()
+    messages.append({"role": "assistant", "content": out})
+    trim_messages()
+    return out
 
 
-def chat_openai(text: str, model: str) -> str:
-    messages.append({"role": "user", "content": text})
-    _trim()
+def chat_ollama(user_text: str, model: str) -> str:
+    cancel_turn.clear()
 
-    resp = client.chat.completions.create(
-        model=model,
-        messages=messages,
-    )
-    reply = (resp.choices[0].message.content or "").strip()
+    sys_msg = messages[0] if (messages and messages[0]["role"] == "system") else None
+    recent = [m for m in messages if m["role"] != "system"][-(LOCAL_TURNS * 2):]
+    local_msgs = ([sys_msg] if sys_msg else []) + recent + [{"role": "user", "content": user_text}]
 
-    messages.append({"role": "assistant", "content": reply})
-    _trim()
-    return reply
+    payload = {"model": model, "messages": local_msgs, "stream": False}
 
+    try:
+        r = requests.post(OLLAMA_URL, json=payload, timeout=180)
+        r.raise_for_status()
+        data = r.json()
+        out = (data.get("message", {}) or {}).get("content", "")
+    except Exception as e:
+        out = f"(ollama error) {e}"
 
-def chat_ollama(text: str, model: str) -> str:
-    """
-    Uses Ollama /api/chat so persona/KB can be sent as a real system message.
-    """
-    messages.append({"role": "user", "content": text})
-    _trim()
+    if cancel_turn.is_set():
+        return ""
 
-    hud_send(backend=HUD_BACKEND_LOCAL, state=HUD_STATE_THINKING, status="Thinking…", memory=get_turn_count())
-    print("Thinking (local)...", flush=True)
+    messages.append({"role": "user", "content": user_text})
+    messages.append({"role": "assistant", "content": (out or "").strip()})
+    trim_messages()
 
-    local_msgs = []
-
-    system_parts = []
-    if persona_text:
-        system_parts.append("PERSONA:\n" + persona_text)
-    if kb_text:
-        system_parts.append("KNOWLEDGE BASE:\n" + kb_text)
-    system_context = "\n\n".join(system_parts).strip()
-    if system_context:
-        local_msgs.append({"role": "system", "content": system_context})
-
-    # Add recent convo (skip system from global list; we already injected above)
-    for m in messages[-LOCAL_TURNS:]:
-        if m.get("role") == "system":
-            continue
-        local_msgs.append({"role": m["role"], "content": m["content"]})
-
-    r = requests.post(
-        "http://127.0.0.1:11434/api/chat",
-        json={
-            "model": model,
-            "messages": local_msgs,
-            "stream": False,
-        },
-        timeout=180,
-    )
-    r.raise_for_status()
-    data = r.json()
-    reply = ((data.get("message") or {}).get("content") or "").strip()
-
-    messages.append({"role": "assistant", "content": reply})
-    _trim()
-    return reply
+    return (out or "").strip()
 
 
-def generate(text: str, route: dict):
+def generate(route_key: str, user_text: str) -> tuple[str, str]:
+    route = ROUTES[route_key]
     backend = route["backend"]
+
     if backend == "openai":
-        return chat_openai(text, route["chat_model"]), "openai"
+        model = route.get("chat_model", OPENAI_CHAT_MODEL_DEFAULT)
+        return chat_openai(user_text, model=model), "OPENAI"
+
     if backend == "ollama":
-        return chat_ollama(text, route["ollama_model"]), "ollama"
+        model = route["ollama_model"]
+        return chat_ollama(user_text, model=model), "LOCAL"
+
     raise ValueError(f"Unknown backend: {backend}")
 
 
 # ----------------------------
-# INTERRUPTIBLE SPEECH
+# SPEAK + INTERRUPT
 # ----------------------------
 
-def _stop_tts_only():
-    """Stop TTS without cancelling the whole turn."""
+def speak(text: str, backend_label: str):
     global tts_proc
-    with tts_lock:
-        if tts_proc and tts_proc.poll() is None:
-            try:
-                tts_proc.terminate()
-                try:
-                    tts_proc.wait(timeout=0.2)
-                except subprocess.TimeoutExpired:
-                    tts_proc.kill()
-            except Exception:
-                pass
-
-
-def speak(text: str):
-    """Start TTS; if already speaking, stop and replace. Also updates HUD back to IDLE when done."""
-    global tts_proc, _speak_token
     if not text:
         return
 
-    # bump token for this "generation" of speech
-    with _speak_token_lock:
-        _speak_token += 1
-        my_token = _speak_token
-
     with tts_lock:
         if tts_proc and tts_proc.poll() is None:
             try:
                 tts_proc.terminate()
-                try:
-                    tts_proc.wait(timeout=0.2)
-                except subprocess.TimeoutExpired:
-                    tts_proc.kill()
             except Exception:
                 pass
 
+        mouth_stop = threading.Event()
+        threading.Thread(target=mouth_ticker_loop, args=(mouth_stop,), daemon=True).start()
+
+        maynard_send("open", why="tts_start")
+
+        if hud_mod:
+            hud_state(
+                state=getattr(hud_mod, "STATE_SPEAKING", "speaking"),
+                status="Speaking...",
+                backend=backend_label,
+                memory=len(messages),
+            )
+
         tts_proc = subprocess.Popen(
-            [TTS_ENGINE, "-v", TTS_VOICE, "-s", str(TTS_RATE), text],
+            [TTS_ENGINE, "-v", TTS_VOICE, "-s", TTS_RATE, text],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
 
-    def watcher(proc, token):
-        proc.wait()
-        # only the latest speech should flip HUD back to idle
-        with _speak_token_lock:
-            if token != _speak_token:
-                return
-        if cancel_turn.is_set():
-            # if interrupted mid-speech, leave the last state update to interrupt()
-            return
-        hud_send(state=HUD_STATE_IDLE, status="Idle / Ready", memory=get_turn_count())
+    def _cleanup(proc, stop_evt):
+        try:
+            proc.wait()
+        finally:
+            stop_evt.set()
+            maynard_send("close", why="tts_end")
+            maynard_send("clear", why="tts_end")
+            if hud_mod:
+                hud_state(
+                    state=getattr(hud_mod, "STATE_IDLE", "idle"),
+                    status="Idle",
+                    backend=backend_label,
+                    memory=len(messages),
+                )
 
-    threading.Thread(target=watcher, args=(tts_proc, my_token), daemon=True).start()
+    threading.Thread(target=_cleanup, args=(tts_proc, mouth_stop), daemon=True).start()
 
 
 def interrupt():
-    """Cancel current turn and stop any active TTS."""
+    global tts_proc
     cancel_turn.set()
-    _stop_tts_only()
+
+    with tts_lock:
+        if tts_proc and tts_proc.poll() is None:
+            try:
+                tts_proc.terminate()
+            except Exception:
+                pass
+
+    maynard_send("close", why="interrupt")
+    maynard_send("clear", why="interrupt")
+
     print("interrupted", flush=True)
-    hud_send(state=HUD_STATE_INTERRUPTED, status="Interrupted!", flash=True, memory=get_turn_count())
+
+    if hud_mod:
+        hud_state(
+            state=getattr(hud_mod, "STATE_INTERRUPTED", "interrupted"),
+            status="Interrupted",
+            flash=True,
+            memory=len(messages),
+        )
+
+
+# ----------------------------
+# RECORD CONTROL
+# ----------------------------
+
+def start_record(route_key: str):
+    global is_recording, active_route_key, stop_event, rec_thread, audio_holder
+
+    cancel_turn.clear()
+    is_recording = True
+    active_route_key = route_key
+    stop_event = threading.Event()
+    audio_holder = {"audio": np.array([], dtype=np.float32)}
+
+    label = "openai" if route_key == "red" else "local"
+    print(f"recording ({label})...", flush=True)
+
+    if hud_mod:
+        backend_label = getattr(hud_mod, "BACKEND_OPENAI", "OPENAI") if route_key == "red" else getattr(hud_mod, "BACKEND_LOCAL", "LOCAL")
+        hud_state(
+            state=getattr(hud_mod, "STATE_RECORDING", "recording"),
+            status=f"Recording ({backend_label})...",
+            backend=backend_label,
+            memory=len(messages),
+        )
+
+    def runner():
+        audio_holder["audio"] = record_audio(stop_event)
+
+    rec_thread = threading.Thread(target=runner, daemon=True)
+    rec_thread.start()
+
+
+def stop_record_and_handle():
+    global is_recording, stop_event, rec_thread, audio_holder, active_route_key
+
+    is_recording = False
+    if stop_event:
+        stop_event.set()
+    if rec_thread:
+        rec_thread.join(timeout=2.0)
+
+    if hud_mod:
+        hud_state(
+            state=getattr(hud_mod, "STATE_THINKING", "thinking"),
+            status="Transcribing...",
+            memory=len(messages),
+        )
+
+    audio = (audio_holder or {}).get("audio", np.array([], dtype=np.float32))
+    text = transcribe(audio)
+
+    if not text:
+        print("(no audio captured)", flush=True)
+        if hud_mod:
+            hud_state(
+                state=getattr(hud_mod, "STATE_IDLE", "idle"),
+                status="Idle",
+                memory=len(messages),
+            )
+        return
+
+    print(f"\nYou: {text}", flush=True)
+
+    if LOG_ENABLED:
+        append_jsonl(LOG_PATH, {"ts": time.time(), "role": "user", "text": text, "route": active_route_key})
+
+    if hud_mod:
+        hud_state(
+            state=getattr(hud_mod, "STATE_THINKING", "thinking"),
+            status="Thinking...",
+            memory=len(messages),
+        )
+
+    reply, backend_label = generate(active_route_key, text)
+
+    if cancel_turn.is_set():
+        print("(cancelled — ignoring reply)", flush=True)
+        if hud_mod:
+            hud_state(
+                state=getattr(hud_mod, "STATE_IDLE", "idle"),
+                status="Idle",
+                memory=len(messages),
+            )
+        return
+
+    print(f"Assistant ({backend_label}): {reply}\n", flush=True)
+
+    if LOG_ENABLED:
+        append_jsonl(LOG_PATH, {"ts": time.time(), "role": "assistant", "text": reply, "backend": backend_label})
+
+    speak(reply, backend_label)
+
+
+# ----------------------------
+# KEYBOARD THREAD
+# ----------------------------
+
+kbd_q: Queue[str] = Queue()
+quit_flag = threading.Event()
+
+def keyboard_thread():
+    while not quit_flag.is_set():
+        try:
+            line = sys.stdin.readline()
+            if not line:
+                time.sleep(0.05)
+                continue
+            cmd = line.strip().lower()
+            if cmd:
+                kbd_q.put(cmd)
+        except Exception:
+            time.sleep(0.1)
+
+def print_help():
+    print("\nKeyboard controls (type + Enter):")
+    print("  o  -> toggle OpenAI record start/stop")
+    print("  l  -> toggle Local/Ollama record start/stop")
+    print("  i  -> interrupt")
+    print("  q  -> quit")
+    print("  h  -> help\n", flush=True)
 
 
 # ----------------------------
 # MAIN
 # ----------------------------
 
-def main():
-    global client, cfg
-    global DEVICE_PATH, SAMPLE_RATE, LOCAL_TURNS
-    global RED_KEY, GREEN_KEY, INTERRUPT_KEY, ROUTES
-    global LOG_ENABLED, LOG_PATH, MAX_TURNS
-    global TTS_ENGINE, TTS_VOICE, TTS_RATE
-    global HUD_ENABLED
-    global persona_text, kb_text, messages
+print("==============================================")
+print(" Lab Partner — Dual PTT + Interrupt + HUD + Persona/KB + Keyboard + Maynard (Debug)")
+print("==============================================")
+print("Gamepad: Red=OpenAI | Green=Local | Yellow=Interrupt")
+print("Keyboard: type then Enter (h for help)")
+print("Ctrl+C to quit.\n")
 
-    load_dotenv()
-    client = OpenAI()
-    cfg = load_config()
+if hud_mod:
+    hud_state(
+        state=getattr(hud_mod, "STATE_IDLE", "idle"),
+        status="Idle",
+        memory=len(messages),
+    )
 
-    DEVICE_PATH = cfg["device_path"]
-    SAMPLE_RATE = cfg["sample_rate"]
-    LOCAL_TURNS = cfg["context"]["local_turns"]
+threading.Thread(target=keyboard_thread, daemon=True).start()
 
-    RED_KEY = cfg["red_key"]
-    GREEN_KEY = cfg["green_key"]
-    INTERRUPT_KEY = cfg["interrupt_key"]
-    ROUTES = cfg["routes"]
+device = InputDevice(DEVICE_PATH)
 
-    LOG_ENABLED = cfg["logging"]["enabled"]
-    LOG_PATH = cfg["logging"]["path"]
-    MAX_TURNS = cfg["logging"]["max_turns_in_memory"]
+try:
+    import select
+except Exception:
+    select = None
 
-    TTS_ENGINE = cfg["tts"]["engine"]
-    TTS_VOICE = cfg["tts"]["voice"]
-    TTS_RATE = cfg["tts"]["rate"]
+try:
+    while True:
+        # Keyboard commands
+        try:
+            cmd = kbd_q.get_nowait()
+        except Empty:
+            cmd = None
 
-    HUD_ENABLED = bool(cfg.get("hud", {}).get("enabled", True))
+        if cmd:
+            if cmd in ("h", "help", "?"):
+                print_help()
+            elif cmd in ("q", "quit", "exit"):
+                print("Quitting...", flush=True)
+                quit_flag.set()
+                break
+            elif cmd in ("i", "interrupt"):
+                interrupt()
+            elif cmd in ("o", "openai"):
+                if not is_recording:
+                    start_record("red")
+                else:
+                    stop_record_and_handle()
+            elif cmd in ("l", "local", "ollama"):
+                if not is_recording:
+                    start_record("green")
+                else:
+                    stop_record_and_handle()
+            else:
+                print(f"(unknown cmd) {cmd} — type 'h' for help", flush=True)
 
-    # Load persona + KB
-    persona_text = read_text_file("persona.txt")
-    kb_text = read_text_file("knowledge_base.txt")
+        # Gamepad events without blocking keyboard responsiveness
+        if select is None:
+            time.sleep(0.01)
+            continue
 
-    system_parts = []
-    if persona_text:
-        system_parts.append("PERSONA:\n" + persona_text)
-    if kb_text:
-        system_parts.append("KNOWLEDGE BASE:\n" + kb_text)
-    system_context = "\n\n".join(system_parts).strip()
+        rlist, _, _ = select.select([device.fd], [], [], 0.01)
+        if not rlist:
+            continue
 
-    print("==============================================")
-    print(" Lab Partner — Dual PTT + Interrupt + HUD")
-    print("==============================================")
-    print("Red = OpenAI | Green = Local | Yellow = Interrupt")
-    print("Ctrl+C to quit.\n")
-
-    if persona_text:
-        print(f"Loaded persona.txt: {len(persona_text)} chars", flush=True)
-    if kb_text:
-        print(f"Loaded knowledge_base.txt: {len(kb_text)} chars", flush=True)
-
-    messages = []
-    if system_context:
-        messages.append({"role": "system", "content": system_context})
-
-    # Start HUD (spawn-safe)
-    start_hud()
-    hud_send(backend=HUD_BACKEND_OPENAI, state=HUD_STATE_IDLE, status="Idle / Ready", memory=get_turn_count())
-
-    device = InputDevice(DEVICE_PATH)
-
-    is_recording = False
-    stop_event = None
-    active_route = None
-    record_thread_local = None
-    audio_buf_local = None
-
-    try:
-        for event in device.read_loop():
+        for event in device.read():
             if event.type != ecodes.EV_KEY:
                 continue
 
-            # Interrupt (press)
             if event.code == INTERRUPT_KEY and event.value == 1:
                 interrupt()
                 continue
 
-            # PTT keys (red/green)
             if event.code in (RED_KEY, GREEN_KEY):
-                # PRESS
-                if event.value == 1:
-                    # IMPORTANT: stop any speech so you don't record the assistant's own voice
-                    _stop_tts_only()
-
-                    cancel_turn.clear()
-                    is_recording = True
-                    stop_event = threading.Event()
-
-                    is_red = (event.code == RED_KEY)
-                    active_route = ROUTES["red"] if is_red else ROUTES["green"]
-
-                    label = "openai" if is_red else "local"
-                    print(f"recording ({label})...", flush=True)
-
-                    hud_send(
-                        backend=HUD_BACKEND_OPENAI if is_red else HUD_BACKEND_LOCAL,
-                        state=HUD_STATE_RECORDING,
-                        status=f"Recording ({label})…",
-                        memory=get_turn_count(),
-                    )
-
-                    def runner():
-                        nonlocal audio_buf_local
-                        audio_buf_local = record_audio(stop_event)
-
-                    record_thread_local = threading.Thread(target=runner, daemon=True)
-                    record_thread_local.start()
-
-                # RELEASE
+                if event.value == 1 and not is_recording:
+                    start_record("red" if event.code == RED_KEY else "green")
                 elif event.value == 0 and is_recording:
-                    is_recording = False
+                    stop_record_and_handle()
 
-                    if stop_event:
-                        stop_event.set()
-
-                    if record_thread_local:
-                        record_thread_local.join(timeout=2.0)
-
-                    text = transcribe(audio_buf_local)
-                    if not text:
-                        hud_send(state=HUD_STATE_IDLE, status="Idle / Ready", memory=get_turn_count())
-                        continue
-
-                    print("\nYou:", text, flush=True)
-
-                    # show thinking in HUD early for whichever backend is active
-                    hud_send(
-                        backend=HUD_BACKEND_OPENAI if active_route["backend"] == "openai" else HUD_BACKEND_LOCAL,
-                        state=HUD_STATE_THINKING,
-                        status="Thinking…",
-                        memory=get_turn_count(),
-                    )
-
-                    reply, backend = generate(text, active_route)
-
-                    if LOG_ENABLED:
-                        append_jsonl(LOG_PATH, {"ts": time.time(), "user": text, "assistant": reply, "backend": backend})
-
-                    # If user hit interrupt during thinking, ignore the reply
-                    if cancel_turn.is_set():
-                        print("(cancelled turn — ignoring reply)", flush=True)
-                        hud_send(state=HUD_STATE_IDLE, status="Cancelled / Ready", memory=get_turn_count())
-                        continue
-
-                    print(f"Assistant ({backend}): {reply}\n", flush=True)
-
-                    hud_send(
-                        backend=HUD_BACKEND_OPENAI if backend == "openai" else HUD_BACKEND_LOCAL,
-                        state=HUD_STATE_SPEAKING,
-                        status="Speaking…",
-                        memory=get_turn_count(),
-                    )
-
-                    speak(reply)
-
-    except KeyboardInterrupt:
-        print("\nExiting...", flush=True)
-    finally:
-        if HUD_ENABLED and hud_q is not None:
-            try:
-                hud_q.put_nowait({"cmd": "quit"})
-            except Exception:
-                pass
-                
-
-if __name__ == "__main__":
-    main()
+except KeyboardInterrupt:
+    print("\nExiting...", flush=True)
+finally:
+    quit_flag.set()
+    try:
+        device.close()
+    except Exception:
+        pass
+    try:
+        maynard_send("close", why="exit")
+        maynard_send("clear", why="exit")
+    except Exception:
+        pass
+    if hud_queue is not None:
+        try:
+            hud_queue.put({"cmd": "quit"})
+        except Exception:
+            pass
