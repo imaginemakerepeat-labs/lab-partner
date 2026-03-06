@@ -1,17 +1,12 @@
-# backends/openai_backend.py
+def chat_openai(client, messages, cancel_turn, user_text: str, model: str) -> str:
+    cancel_turn.clear()
+    messages.append({"role": "user", "content": user_text})
 
-def chat_openai(client, messages, text: str, model: str) -> str:
-    """
-    Mutates messages in-place by appending user + assistant turns.
-    Returns assistant reply.
-    """
-    messages.append({"role": "user", "content": text})
+    resp = client.chat.completions.create(model=model, messages=messages)
 
-    resp = client.chat.completions.create(
-        model=model,
-        messages=messages,
-    )
+    if cancel_turn.is_set():
+        return ""
 
-    reply = (resp.choices[0].message.content or "").strip()
-    messages.append({"role": "assistant", "content": reply})
-    return reply
+    out = (resp.choices[0].message.content or "").strip()
+    messages.append({"role": "assistant", "content": out})
+    return out

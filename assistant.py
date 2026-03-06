@@ -43,6 +43,9 @@ from audio import record_audio, transcribe
 from memory import trim_messages
 from mouth import MouthController
 from tts import TTSController
+
+from backends.openai_backend import chat_openai
+from backends.ollama_backend import chat_ollama
 # ----------------------------
 # INIT
 # ----------------------------
@@ -160,60 +163,24 @@ mouth = MouthController(MAYNARD_ENABLED, MAYNARD_IP, MAYNARD_PORT)
 # CHAT
 # ----------------------------
 
-def chat_openai(user_text: str, model: str) -> str:
-    cancel_turn.clear()
-    messages.append({"role": "user", "content": user_text})
-    messages[:] = trim_messages(messages, MAX_TURNS)
-
-    resp = client.chat.completions.create(model=model, messages=messages)
-
-    if cancel_turn.is_set():
-        return ""
-
-    out = (resp.choices[0].message.content or "").strip()
-    messages.append({"role": "assistant", "content": out})
-    messages[:] = trim_messages(messages, MAX_TURNS)
-    return out
-
-
-def chat_ollama(user_text: str, model: str) -> str:
-    cancel_turn.clear()
-
-    sys_msg = messages[0] if (messages and messages[0]["role"] == "system") else None
-    recent = [m for m in messages if m["role"] != "system"][-(LOCAL_TURNS * 2):]
-    local_msgs = ([sys_msg] if sys_msg else []) + recent + [{"role": "user", "content": user_text}]
-
-    payload = {"model": model, "messages": local_msgs, "stream": False}
-
-    try:
-        r = requests.post(OLLAMA_URL, json=payload, timeout=180)
-        r.raise_for_status()
-        data = r.json()
-        out = (data.get("message", {}) or {}).get("content", "")
-    except Exception as e:
-        out = f"(ollama error) {e}"
-
-    if cancel_turn.is_set():
-        return ""
-
-    messages.append({"role": "user", "content": user_text})
-    messages.append({"role": "assistant", "content": (out or "").strip()})
-    trim_messages()
-
-    return (out or "").strip()
-
 
 def generate(route_key: str, user_text: str) -> tuple[str, str]:
+    global messages
+
     route = ROUTES[route_key]
     backend = route["backend"]
 
     if backend == "openai":
         model = route.get("chat_model", OPENAI_CHAT_MODEL_DEFAULT)
-        return chat_openai(user_text, model=model), "OPENAI"
+        reply = chat_openai(client, messages, cancel_turn, user_text, model)
+        messages[:] = trim_messages(messages, MAX_TURNS)
+        return reply, "OPENAI"
 
     if backend == "ollama":
         model = route["ollama_model"]
-        return chat_ollama(user_text, model=model), "LOCAL"
+        reply = chat_ollama(messages, cancel_turn, user_text, model, OLLAMA_URL, LOCAL_TURNS)
+        messages[:] = trim_messages(messages, MAX_TURNS)
+        return reply, "LOCAL"
 
     raise ValueError(f"Unknown backend: {backend}")
 
