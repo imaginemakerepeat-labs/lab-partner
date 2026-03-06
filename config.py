@@ -32,11 +32,12 @@ DEFAULT_CONFIG = {
     "prompt_files": {"persona": "persona.txt", "knowledge_base": "knowledge_base.txt"},
 
     "wake_word": {
-    "enabled": True,
-    "model": "alexa",
-    "threshold": 0.6,
-    "cooldown": 2.0,
-    "command_seconds": 4
+        "enabled": True,
+        "model_path": "/home/sjaguilar/Development/work_assistant/venv/lib/python3.13/site-packages/openwakeword/resources/models/alexa_v0.1.onnx",
+        "threshold": 0.75,
+        "cooldown": 10.0,
+        "command_seconds": 3,
+        "followup_seconds": 4
     },
 
 }

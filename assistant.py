@@ -48,6 +48,8 @@ from backends.openai_backend import chat_openai
 from backends.ollama_backend import chat_ollama
 
 from skills import run_skill
+
+from wake_word import WakeWordListener
 # ----------------------------
 # INIT
 # ----------------------------
@@ -88,6 +90,14 @@ MAYNARD_PORT = int(cfg.get("maynard", {}).get("port", 9000))
 
 PROMPT_PERSONA = cfg.get("prompt_files", {}).get("persona", "persona.txt")
 PROMPT_KB = cfg.get("prompt_files", {}).get("knowledge_base", "knowledge_base.txt")
+
+WAKE_CFG = cfg.get("wake_word", {})
+WAKE_ENABLED = bool(WAKE_CFG.get("enabled", False))
+WAKE_MODEL = WAKE_CFG.get("model_path", "")
+WAKE_THRESHOLD = float(WAKE_CFG.get("threshold", 0.6))
+WAKE_COOLDOWN = float(WAKE_CFG.get("cooldown", 2.0))
+WAKE_COMMAND_SECONDS = float(WAKE_CFG.get("command_seconds", 4))
+WAKE_FOLLOWUP_SECONDS = float(WAKE_CFG.get("followup_seconds", 4))
 
 
 # ----------------------------
@@ -191,7 +201,11 @@ def generate(route_key: str, user_text: str) -> tuple[str, str]:
 # SPEAK + INTERRUPT
 # ----------------------------
 
+wake_busy = threading.Event()
+tts_active = threading.Event()
+
 def speak(text: str, backend_label: str):
+    tts_active.set()
     global tts_proc
     if not text:
         return
@@ -212,6 +226,7 @@ def speak(text: str, backend_label: str):
     tts_proc = tts.speak(text)
 
     def _cleanup(proc, stop_evt):
+        tts_active.clear()
         try:
             proc.wait()
         finally:
@@ -369,6 +384,122 @@ def stop_record_and_handle():
     speak(reply, backend_label)
 
 
+def run_wake_word_turn():
+    global audio_holder
+
+    if is_recording or tts_active.is_set() or wake_busy.is_set():
+        return
+
+    wake_busy.set()
+    try:
+        cancel_turn.clear()
+
+        print("[WAKE] triggered", flush=True)
+
+        if hud_mod:
+            hud_state(
+                state=getattr(hud_mod, "STATE_SPEAKING", "speaking"),
+                status="Wake acknowledged...",
+                backend="WAKE",
+                memory=len(messages),
+            )
+
+        # Stage 1: acknowledge wake word
+        speak("Yes?", "WAKE")
+
+        # Small pause so TTS starts/finishes cleanly before follow-up recording
+        time.sleep(1.0)
+
+        if cancel_turn.is_set():
+            if hud_mod:
+                hud_state(
+                    state=getattr(hud_mod, "STATE_IDLE", "idle"),
+                    status="Idle",
+                    memory=len(messages),
+                )
+            return
+
+        # Stage 2: listen for the actual command
+        if hud_mod:
+            hud_state(
+                state=getattr(hud_mod, "STATE_RECORDING", "recording"),
+                status="Listening for command...",
+                backend="WAKE",
+                memory=len(messages),
+            )
+
+        stop_evt = threading.Event()
+        audio_holder = {"audio": np.array([], dtype=np.float32)}
+
+        def stop_later():
+            time.sleep(WAKE_FOLLOWUP_SECONDS)
+            stop_evt.set()
+
+        threading.Thread(target=stop_later, daemon=True).start()
+
+        audio = record_audio(stop_evt, SAMPLE_RATE)
+        audio_holder["audio"] = audio
+
+        duration = len(audio) / SAMPLE_RATE if audio is not None else 0
+
+        if duration < 0.12:
+            print(f"[WAKE] ignoring short audio ({duration:.3f}s)", flush=True)
+            if hud_mod:
+                hud_state(
+                    state=getattr(hud_mod, "STATE_IDLE", "idle"),
+                    status="Idle",
+                    memory=len(messages),
+                )
+            return
+
+        if hud_mod:
+            hud_state(
+                state=getattr(hud_mod, "STATE_THINKING", "thinking"),
+                status="Transcribing...",
+                memory=len(messages),
+            )
+
+        text = transcribe(client, audio, SAMPLE_RATE, STT_MODEL)
+
+        if not text:
+            print("(no wake follow-up captured)", flush=True)
+            if hud_mod:
+                hud_state(
+                    state=getattr(hud_mod, "STATE_IDLE", "idle"),
+                    status="Idle",
+                    memory=len(messages),
+                )
+            return
+
+        print(f"\nYou: {text}", flush=True)
+
+        handled, skill_reply = run_skill(text)
+        if handled:
+            reply = skill_reply
+            backend_label = "SKILL"
+        else:
+            reply, backend_label = generate("red", text)
+
+        if cancel_turn.is_set():
+            print("(cancelled — ignoring wake reply)", flush=True)
+            if hud_mod:
+                hud_state(
+                    state=getattr(hud_mod, "STATE_IDLE", "idle"),
+                    status="Idle",
+                    memory=len(messages),
+                )
+            return
+
+        print(f"Assistant ({backend_label}): {reply}\n", flush=True)
+
+        if LOG_ENABLED:
+            append_jsonl(LOG_PATH, {"ts": time.time(), "role": "user", "text": text, "route": "wake_followup"})
+            append_jsonl(LOG_PATH, {"ts": time.time(), "role": "assistant", "text": reply, "backend": backend_label})
+
+        speak(reply, backend_label)
+
+    finally:
+        wake_busy.clear()
 # ----------------------------
 # KEYBOARD THREAD
 # ----------------------------
@@ -419,6 +550,22 @@ if hud_mod:
 threading.Thread(target=keyboard_thread, daemon=True).start()
 
 device = InputDevice(DEVICE_PATH)
+
+
+wake_listener = None
+
+if WAKE_ENABLED:
+    try:
+        wake_listener = WakeWordListener(
+            model_name=WAKE_MODEL,
+            threshold=WAKE_THRESHOLD,
+            cooldown=WAKE_COOLDOWN,
+            sample_rate=SAMPLE_RATE,
+            callback=run_wake_word_turn,
+        )
+        wake_listener.start()
+    except Exception as e:
+        print(f"[WAKE] failed to start: {e}", flush=True)
 
 try:
     import select
@@ -494,5 +641,11 @@ finally:
     if hud_queue is not None:
         try:
             hud_queue.put({"cmd": "quit"})
+        except Exception:
+            pass
+
+    if wake_listener:
+        try:
+            wake_listener.stop()
         except Exception:
             pass
