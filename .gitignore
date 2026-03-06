@@ -27,6 +27,7 @@ logs/
 # ----------------------------
 persona.txt
 knowledge_base.txt
+notes.txt
 
 # (Keep these tracked)
 # persona.txt.example
