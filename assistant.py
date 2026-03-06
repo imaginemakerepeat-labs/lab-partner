@@ -29,7 +29,6 @@ Maynard mouth:
 import sys
 import json
 import time
-import socket
 import subprocess
 import threading
 from queue import Queue, Empty
@@ -42,6 +41,7 @@ from evdev import InputDevice, ecodes
 from config import load_config, append_jsonl, read_text_file
 from audio import record_audio, transcribe 
 from memory import trim_messages
+from mouth import MouthController
 # ----------------------------
 # INIT
 # ----------------------------
@@ -150,70 +150,9 @@ stop_event = None
 rec_thread = None
 audio_holder = {"audio": np.array([], dtype=np.float32)}
 
-mouth_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+mouth = MouthController(MAYNARD_ENABLED, MAYNARD_IP, MAYNARD_PORT)
 
 
-# ----------------------------
-# MAYNARD MOUTH DEBUG
-# ----------------------------
-
-MOUTH_DEBUG = True
-MOUTH_DEBUG_EVERY = 1   # print every N sends (1=all; set 10 to reduce spam)
-mouth_seq = 0
-mouth_sent = 0
-
-def maynard_send(cmd: str, why: str = "") -> None:
-    """Send UDP mouth command with seq/timestamp (for debug)."""
-    global mouth_seq, mouth_sent
-    if not MAYNARD_ENABLED:
-        return
-
-    mouth_seq += 1
-    mouth_sent += 1
-    payload = f"{mouth_seq}|{time.time():.3f}|{cmd}"
-
-    try:
-        mouth_sock.sendto(payload.encode("utf-8"), (MAYNARD_IP, MAYNARD_PORT))
-        if MOUTH_DEBUG and (mouth_sent % MOUTH_DEBUG_EVERY == 0):
-            print(f"[MOUTH->] seq={mouth_seq} cmd={cmd} why={why}", flush=True)
-    except Exception as e:
-        print(f"[MOUTH!!] send failed seq={mouth_seq} cmd={cmd} err={e}", flush=True)
-
-
-def _char_to_viseme(ch: str):
-    c = ch.lower()
-    if c in "mbp":
-        return "close"
-    if c in "ei":
-        return "wide"
-    if c in "aou":
-        return "open"
-    if c == "y":
-        return "wide"
-    return None
-
-
-def mouth_ticker_loop(stop_evt: threading.Event) -> None:
-    """
-    Loop animation while speaking:
-    Keeps sending packets until stop_evt or cancel_turn is set.
-    """
-    print("[MOUTH] loop start", flush=True)
-    cycle = ["open", "wide", "open", "close"]
-    idx = 0
-
-    try:
-        while not stop_evt.is_set() and not cancel_turn.is_set():
-            cmd = cycle[idx % len(cycle)]
-            maynard_send(cmd, why="loop")
-            idx += 1
-            time.sleep(0.08)  # ~12.5 fps; try 0.06 for snappier
-    except Exception as e:
-        print(f"[MOUTH!!] loop exception: {e}", flush=True)
-
-    maynard_send("close", why="loop_end")
-    maynard_send("clear", why="loop_end")
-    print("[MOUTH] loop end", flush=True)
 
 # ----------------------------
 # AUDIO
@@ -300,9 +239,9 @@ def speak(text: str, backend_label: str):
                 pass
 
         mouth_stop = threading.Event()
-        threading.Thread(target=mouth_ticker_loop, args=(mouth_stop,), daemon=True).start()
 
-        maynard_send("open", why="tts_start")
+        threading.Thread(target=mouth.ticker_loop, args=(mouth_stop, cancel_turn), daemon=True).start()
+        mouth.send("open", why="tts_start")
 
         if hud_mod:
             hud_state(
@@ -323,8 +262,10 @@ def speak(text: str, backend_label: str):
             proc.wait()
         finally:
             stop_evt.set()
-            maynard_send("close", why="tts_end")
-            maynard_send("clear", why="tts_end")
+            
+            mouth.send("close", why="tts_end")
+            mouth.send("clear", why="tts_end")
+            
             if hud_mod:
                 hud_state(
                     state=getattr(hud_mod, "STATE_IDLE", "idle"),
@@ -347,8 +288,8 @@ def interrupt():
             except Exception:
                 pass
 
-    maynard_send("close", why="interrupt")
-    maynard_send("clear", why="interrupt")
+    mouth.send("close", why="interrupt")
+    mouth.send("clear", why="interrupt")
 
     print("interrupted", flush=True)
 
@@ -576,8 +517,8 @@ finally:
     except Exception:
         pass
     try:
-        maynard_send("close", why="exit")
-        maynard_send("clear", why="exit")
+        mouth.send("close", why="exit")
+        mouth.send("clear", why="exit")
     except Exception:
         pass
     if hud_queue is not None:

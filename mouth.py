@@ -1,76 +1,50 @@
-# mouth.py
 import socket
-import threading
 import time
-from typing import Optional
+import threading
+
+
+MOUTH_DEBUG = True
+MOUTH_DEBUG_EVERY = 1
 
 
 class MouthController:
-    """
-    UDP mouth driver + simple ticker animation.
-    Commands emitted: open / wide / close / clear
-    Payload: "<seq>|<epoch>|<cmd>"
-    """
-
-    def __init__(self, enabled: bool, ip: str, port: int, interval: float = 0.12):
+    def __init__(self, enabled: bool, ip: str, port: int):
         self.enabled = enabled
         self.ip = ip
         self.port = port
-        self.interval = interval
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.seq = 0
+        self.sent = 0
 
-        self._seq = 0
-        self._sock: Optional[socket.socket] = None
-
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-        if self.enabled:
-            try:
-                self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            except Exception:
-                self._sock = None
-                self.enabled = False
-
-    def send(self, cmd: str, why: str = ""):
-        if not self.enabled or not self._sock:
+    def send(self, cmd: str, why: str = "") -> None:
+        if not self.enabled:
             return
 
-        self._seq += 1
-        payload = f"{self._seq}|{time.time():.3f}|{cmd}"
+        self.seq += 1
+        self.sent += 1
+        payload = f"{self.seq}|{time.time():.3f}|{cmd}"
 
         try:
-            self._sock.sendto(payload.encode(), (self.ip, self.port))
-            if why:
-                print(f"[MOUTH->] seq={self._seq} cmd={cmd} why={why}", flush=True)
-            else:
-                print(f"[MOUTH->] seq={self._seq} cmd={cmd}", flush=True)
-        except Exception:
-            pass
+            self.sock.sendto(payload.encode("utf-8"), (self.ip, self.port))
+            if MOUTH_DEBUG and (self.sent % MOUTH_DEBUG_EVERY == 0):
+                print(f"[MOUTH->] seq={self.seq} cmd={cmd} why={why}", flush=True)
+        except Exception as e:
+            print(f"[MOUTH!!] send failed seq={self.seq} cmd={cmd} err={e}", flush=True)
 
-    def stop_ticker(self):
-        self._stop.set()
+    def ticker_loop(self, stop_evt: threading.Event, cancel_turn: threading.Event) -> None:
+        print("[MOUTH] loop start", flush=True)
+        cycle = ["open", "wide", "open", "close"]
+        idx = 0
 
-    def start_ticker(self):
-        if not self.enabled or not self._sock:
-            return
+        try:
+            while not stop_evt.is_set() and not cancel_turn.is_set():
+                cmd = cycle[idx % len(cycle)]
+                self.send(cmd, why="loop")
+                idx += 1
+                time.sleep(0.08)
+        except Exception as e:
+            print(f"[MOUTH!!] loop exception: {e}", flush=True)
 
-        # stop any existing ticker
-        self.stop_ticker()
-        self._stop.clear()
-
-        def run():
-            self.send("open", "tts_start")
-
-            pattern = ["wide", "close", "open", "wide", "open"]
-            i = 0
-
-            while not self._stop.is_set():
-                self.send(pattern[i % len(pattern)], "viseme")
-                i += 1
-                time.sleep(self.interval)
-
-            self.send("close", "ticker_end")
-            self.send("clear", "tts_end")
-
-        self._thread = threading.Thread(target=run, daemon=True)
-        self._thread.start()
+        self.send("close", why="loop_end")
+        self.send("clear", why="loop_end")
+        print("[MOUTH] loop end", flush=True)
