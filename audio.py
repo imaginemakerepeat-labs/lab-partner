@@ -18,9 +18,9 @@ def record_audio(stop_event, sample_rate: int):
             sd.sleep(50)
 
     if not chunks:
-        return np.zeros((0, 1), dtype=np.float32)
+        return np.array([], dtype=np.float32)
 
-    return np.concatenate(chunks, axis=0)
+    return np.concatenate(chunks, axis=0).flatten().astype(np.float32)
 
 
 def transcribe(client, audio, sample_rate: int, stt_model: str) -> str:

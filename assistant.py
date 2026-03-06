@@ -30,21 +30,17 @@ import sys
 import json
 import time
 import socket
-import tempfile
 import subprocess
 import threading
-from pathlib import Path
 from queue import Queue, Empty
 
 import requests
 import numpy as np
-import sounddevice as sd
-import soundfile as sf
 from dotenv import load_dotenv
 from openai import OpenAI
 from evdev import InputDevice, ecodes
 from config import load_config, append_jsonl, read_text_file
-
+from audio import record_audio, transcribe 
 # ----------------------------
 # INIT
 # ----------------------------
@@ -233,44 +229,6 @@ def mouth_ticker_loop(stop_evt: threading.Event) -> None:
 # AUDIO
 # ----------------------------
 
-def record_audio(stop_evt: threading.Event) -> np.ndarray:
-    frames = []
-
-    def callback(indata, frame_count, time_info, status):
-        frames.append(indata.copy())
-        if stop_evt.is_set():
-            raise sd.CallbackStop()
-
-    try:
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=callback):
-            while not stop_evt.is_set():
-                sd.sleep(50)
-    except Exception:
-        return np.array([], dtype=np.float32)
-
-    if not frames:
-        return np.array([], dtype=np.float32)
-
-    return np.concatenate(frames, axis=0).flatten().astype(np.float32)
-
-
-def transcribe(audio: np.ndarray) -> str:
-    if audio is None or getattr(audio, "size", 0) == 0:
-        return ""
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        sf.write(f.name, audio, SAMPLE_RATE)
-        wav_path = f.name
-
-    try:
-        with open(wav_path, "rb") as f:
-            resp = client.audio.transcriptions.create(model=STT_MODEL, file=f)
-        return (resp.text or "").strip()
-    finally:
-        try:
-            Path(wav_path).unlink()
-        except Exception:
-            pass
 
 
 # ----------------------------
@@ -430,7 +388,11 @@ def start_record(route_key: str):
     print(f"recording ({label})...", flush=True)
 
     if hud_mod:
-        backend_label = getattr(hud_mod, "BACKEND_OPENAI", "OPENAI") if route_key == "red" else getattr(hud_mod, "BACKEND_LOCAL", "LOCAL")
+        backend_label = (
+            getattr(hud_mod, "BACKEND_OPENAI", "OPENAI")
+            if route_key == "red"
+            else getattr(hud_mod, "BACKEND_LOCAL", "LOCAL")
+        )
         hud_state(
             state=getattr(hud_mod, "STATE_RECORDING", "recording"),
             status=f"Recording ({backend_label})...",
@@ -439,7 +401,7 @@ def start_record(route_key: str):
         )
 
     def runner():
-        audio_holder["audio"] = record_audio(stop_event)
+        audio_holder["audio"] = record_audio(stop_event, SAMPLE_RATE)
 
     rec_thread = threading.Thread(target=runner, daemon=True)
     rec_thread.start()
@@ -462,7 +424,7 @@ def stop_record_and_handle():
         )
 
     audio = (audio_holder or {}).get("audio", np.array([], dtype=np.float32))
-    text = transcribe(audio)
+    text = transcribe(client, audio, SAMPLE_RATE, STT_MODEL)
 
     if not text:
         print("(no audio captured)", flush=True)
