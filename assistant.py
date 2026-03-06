@@ -46,6 +46,8 @@ from tts import TTSController
 
 from backends.openai_backend import chat_openai
 from backends.ollama_backend import chat_ollama
+
+from skills import run_skill
 # ----------------------------
 # INIT
 # ----------------------------
@@ -320,6 +322,22 @@ def stop_record_and_handle():
         return
 
     print(f"\nYou: {text}", flush=True)
+    handled, skill_reply = run_skill(text)
+
+    if handled:
+        reply = skill_reply
+        backend_label = "SKILL"
+
+        print(f"Assistant ({backend_label}): {reply}\n", flush=True)
+
+        if LOG_ENABLED:
+            append_jsonl(
+                LOG_PATH,
+                {"ts": time.time(), "role": "assistant", "text": reply, "backend": backend_label},
+            )
+
+        speak(reply, backend_label)
+        return
 
     if LOG_ENABLED:
         append_jsonl(LOG_PATH, {"ts": time.time(), "role": "user", "text": text, "route": active_route_key})
