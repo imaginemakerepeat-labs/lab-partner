@@ -42,6 +42,7 @@ from config import load_config, append_jsonl, read_text_file
 from audio import record_audio, transcribe 
 from memory import trim_messages
 from mouth import MouthController
+from tts import TTSController
 # ----------------------------
 # INIT
 # ----------------------------
@@ -59,6 +60,9 @@ OPENAI_CHAT_MODEL_DEFAULT = cfg["models"]["chat"]
 TTS_ENGINE = cfg["tts"]["engine"]
 TTS_VOICE = cfg["tts"]["voice"]
 TTS_RATE = str(cfg["tts"]["rate"])
+
+tts = TTSController(TTS_ENGINE, TTS_VOICE, TTS_RATE)
+
 
 LOG_ENABLED = bool(cfg["logging"]["enabled"])
 LOG_PATH = cfg["logging"]["path"]
@@ -152,14 +156,6 @@ audio_holder = {"audio": np.array([], dtype=np.float32)}
 
 mouth = MouthController(MAYNARD_ENABLED, MAYNARD_IP, MAYNARD_PORT)
 
-
-
-# ----------------------------
-# AUDIO
-# ----------------------------
-
-
-
 # ----------------------------
 # CHAT
 # ----------------------------
@@ -231,31 +227,20 @@ def speak(text: str, backend_label: str):
     if not text:
         return
 
-    with tts_lock:
-        if tts_proc and tts_proc.poll() is None:
-            try:
-                tts_proc.terminate()
-            except Exception:
-                pass
+    mouth_stop = threading.Event()
+    threading.Thread(target=mouth.ticker_loop, args=(mouth_stop, cancel_turn), daemon=True).start()
 
-        mouth_stop = threading.Event()
+    mouth.send("open", why="tts_start")
 
-        threading.Thread(target=mouth.ticker_loop, args=(mouth_stop, cancel_turn), daemon=True).start()
-        mouth.send("open", why="tts_start")
-
-        if hud_mod:
-            hud_state(
-                state=getattr(hud_mod, "STATE_SPEAKING", "speaking"),
-                status="Speaking...",
-                backend=backend_label,
-                memory=len(messages),
-            )
-
-        tts_proc = subprocess.Popen(
-            [TTS_ENGINE, "-v", TTS_VOICE, "-s", TTS_RATE, text],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+    if hud_mod:
+        hud_state(
+            state=getattr(hud_mod, "STATE_SPEAKING", "speaking"),
+            status="Speaking...",
+            backend=backend_label,
+            memory=len(messages),
         )
+
+    tts_proc = tts.speak(text)
 
     def _cleanup(proc, stop_evt):
         try:
