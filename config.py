@@ -32,12 +32,12 @@ DEFAULT_CONFIG = {
     "prompt_files": {"persona": "persona.txt", "knowledge_base": "knowledge_base.txt"},
 
     "wake_word": {
-    "enabled": true,
+    "enabled": True,
     "model": "alexa",
     "threshold": 0.6,
     "cooldown": 2.0,
     "command_seconds": 4
-    }
+    },
 
 }
 
