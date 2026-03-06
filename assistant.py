@@ -41,6 +41,7 @@ from openai import OpenAI
 from evdev import InputDevice, ecodes
 from config import load_config, append_jsonl, read_text_file
 from audio import record_audio, transcribe 
+from memory import trim_messages
 # ----------------------------
 # INIT
 # ----------------------------
@@ -151,17 +152,6 @@ audio_holder = {"audio": np.array([], dtype=np.float32)}
 
 mouth_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-def trim_messages():
-    if not messages:
-        return
-    sys_msg = messages[0] if messages[0]["role"] == "system" else None
-    rest = messages[1:] if sys_msg else messages
-    rest = rest[-(MAX_TURNS * 2):]
-    messages.clear()
-    if sys_msg:
-        messages.append(sys_msg)
-    messages.extend(rest)
-
 
 # ----------------------------
 # MAYNARD MOUTH DEBUG
@@ -238,7 +228,7 @@ def mouth_ticker_loop(stop_evt: threading.Event) -> None:
 def chat_openai(user_text: str, model: str) -> str:
     cancel_turn.clear()
     messages.append({"role": "user", "content": user_text})
-    trim_messages()
+    messages[:] = trim_messages(messages, MAX_TURNS)
 
     resp = client.chat.completions.create(model=model, messages=messages)
 
@@ -247,7 +237,7 @@ def chat_openai(user_text: str, model: str) -> str:
 
     out = (resp.choices[0].message.content or "").strip()
     messages.append({"role": "assistant", "content": out})
-    trim_messages()
+    messages[:] = trim_messages(messages, MAX_TURNS)
     return out
 
 
