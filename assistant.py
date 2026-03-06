@@ -1,27 +1,131 @@
 #!/usr/bin/env python3
 """
-Lab Partner — Dual PTT + Interrupt + Skills
+Lab Partner — Dual PTT + Interrupt
+Red   = OpenAI (PTT hold)
+Green = Ollama (PTT hold)
+Yellow/Interrupt = BTN_PINKIE (press to interrupt speech + cancel current turn)
+
+Notes:
+- Prints "recording (openai)..." / "recording (local)..." when PTT is pressed
+- Prints "interrupted" when interrupt is pressed
 """
 
+import os
+import json
+import tempfile
+import subprocess
 import threading
-import time
-from typing import Optional
+from pathlib import Path
 
+import requests
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
 from dotenv import load_dotenv
 from openai import OpenAI
 from evdev import InputDevice, ecodes
 
-from config import load_config, append_jsonl, read_text_file
+from wake_word import WakeWordListener
 
-from backends.openai_backend import chat_openai as backend_openai
-from backends.ollama_backend import chat_ollama as backend_ollama
 
-from audio import record_audio, transcribe
-from tts import TTSController
-from mouth import MouthController
-from hud_controller import HudController
-from memory import ChatMemory
-from skills import run_skill
+# ----------------------------
+# DEFAULT CONFIG
+# ----------------------------
+
+DEFAULT_CONFIG = {
+    "device_path": "/dev/input/by-id/usb-0079_USB_Gamepad-event-joystick",
+    "sample_rate": 16000,
+
+    "models": {
+        "stt": "whisper-1",
+        "chat": "gpt-4o"
+    },
+
+    "tts": {
+        "engine": "espeak-ng",
+        "voice": "en-us",
+        "rate": 175
+    },
+
+    "logging": {
+        "enabled": True,
+        "path": "logs/conversation.jsonl",
+        "max_turns_in_memory": 12
+    },
+
+    "context": {
+        "local_turns": 6
+    },
+
+    "buttons": {
+        "red_ptt": "BTN_THUMB",
+        "green_ptt": "BTN_TOP",
+        # IMPORTANT: your evtest shows interrupt is BTN_PINKIE (code 293)
+        "interrupt": "BTN_PINKIE"
+    },
+
+    "routes": {
+        "red": {
+            "backend": "openai",
+            "chat_model": "gpt-4o"
+        },
+        "green": {
+            "backend": "ollama",
+            "ollama_model": "qwen2.5:1.5b-instruct"
+        }
+    },
+
+    # Optional wake word support
+    "wake_word": {
+        "enabled": False,
+        "model_name": "alexa",
+        "threshold": 0.5,
+        "cooldown": 2.0
+    }
+}
+
+
+# ----------------------------
+# CONFIG HELPERS
+# ----------------------------
+
+def _deep_merge(base, override):
+    result = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(result.get(k), dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+def _ecode(name: str) -> int:
+    if not hasattr(ecodes, name):
+        raise ValueError(f"Unknown button '{name}' (not in evdev.ecodes)")
+    return getattr(ecodes, name)
+
+
+def load_config(path="config.json"):
+    config = dict(DEFAULT_CONFIG)
+    p = Path(path)
+
+    if p.exists():
+        with p.open("r", encoding="utf-8") as f:
+            config = _deep_merge(config, json.load(f))
+
+    buttons = config["buttons"]
+    config["red_key"] = _ecode(buttons["red_ptt"])
+    config["green_key"] = _ecode(buttons["green_ptt"])
+    config["interrupt_key"] = _ecode(buttons["interrupt"])
+
+    return config
+
+
+def append_jsonl(path, obj):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj) + "\n")
 
 
 # ----------------------------
@@ -35,6 +139,7 @@ cfg = load_config()
 
 DEVICE_PATH = cfg["device_path"]
 SAMPLE_RATE = cfg["sample_rate"]
+LOCAL_TURNS = cfg["context"]["local_turns"]
 
 RED_KEY = cfg["red_key"]
 GREEN_KEY = cfg["green_key"]
@@ -46,109 +151,212 @@ LOG_ENABLED = cfg["logging"]["enabled"]
 LOG_PATH = cfg["logging"]["path"]
 MAX_TURNS = cfg["logging"]["max_turns_in_memory"]
 
-LOCAL_TURNS = cfg["context"]["local_turns"]
-
 TTS_ENGINE = cfg["tts"]["engine"]
 TTS_VOICE = cfg["tts"]["voice"]
 TTS_RATE = cfg["tts"]["rate"]
 
-OLLAMA_URL = cfg["ollama"]["url"]
+WAKE_CFG = cfg.get("wake_word", {})
+WAKE_ENABLED = WAKE_CFG.get("enabled", False)
 
-# Maynard mouth
-MAYNARD_ENABLED = cfg.get("maynard", {}).get("enabled", False)
-MAYNARD_IP = cfg.get("maynard", {}).get("ip", "127.0.0.1")
-MAYNARD_PORT = int(cfg.get("maynard", {}).get("port", 9000))
+messages = []
 
+# interrupt + recording control
 cancel_turn = threading.Event()
+tts_proc = None
+tts_lock = threading.Lock()
 
-record_thread: Optional[threading.Thread] = None
+record_thread = None
 audio_buffer = None
 
-memory = ChatMemory(MAX_TURNS)
-
 
 # ----------------------------
-# HUD / MOUTH / TTS
+# AUDIO
 # ----------------------------
 
-hud = HudController()
+def record_audio(stop_event: threading.Event):
+    chunks = []
 
-mouth = MouthController(
-    enabled=MAYNARD_ENABLED,
-    ip=MAYNARD_IP,
-    port=MAYNARD_PORT,
-    interval=0.12,
-)
+    def callback(indata, frames, time_info, status):
+        chunks.append(indata.copy())
 
-tts = TTSController(
-    engine=TTS_ENGINE,
-    voice=TTS_VOICE,
-    rate=TTS_RATE,
-    on_speaking=lambda: (
-        mouth.start_ticker(),
-        hud.set("speaking"),
-    ),
-    on_idle=lambda: (
-        mouth.stop_ticker(),
-        hud.set("idle"),
-    ),
-    on_interrupt=lambda: (
-        mouth.stop_ticker(),
-        mouth.send("close", "interrupt"),
-        mouth.send("clear", "interrupt"),
-        hud.set("interrupted"),
-    ),
-)
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=callback):
+        while not stop_event.is_set():
+            sd.sleep(50)
+
+    if not chunks:
+        return np.zeros((0, 1), dtype=np.float32)
+
+    return np.concatenate(chunks, axis=0)
 
 
-# ----------------------------
-# PERSONA / KNOWLEDGE
-# ----------------------------
+def transcribe(audio) -> str:
+    if audio is None or getattr(audio, "size", 0) == 0:
+        return ""
 
-persona = read_text_file(cfg["prompt_files"]["persona"])
-knowledge = read_text_file(cfg["prompt_files"]["knowledge_base"])
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        sf.write(tmp.name, audio, SAMPLE_RATE)
+        tmp_path = tmp.name
 
-system_prompt = "\n".join([p for p in [persona, knowledge] if p]).strip()
-
-if system_prompt:
-    memory.set_system(system_prompt)
+    try:
+        with open(tmp_path, "rb") as f:
+            resp = client.audio.transcriptions.create(
+                model=cfg["models"]["stt"],
+                file=f
+            )
+        return (resp.text or "").strip()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
 
 
 # ----------------------------
 # CHAT
 # ----------------------------
 
+def _trim():
+    global messages
+    messages = messages[-MAX_TURNS:]
+
+
+def chat_openai(text: str, model: str) -> str:
+    messages.append({"role": "user", "content": text})
+    _trim()
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages
+    )
+
+    reply = (resp.choices[0].message.content or "").strip()
+    messages.append({"role": "assistant", "content": reply})
+    _trim()
+    return reply
+
+
+def _local_prompt() -> str:
+    lines = ["You are Lab Partner, a concise workshop assistant.\n"]
+    for m in messages[-LOCAL_TURNS:]:
+        role = "User" if m["role"] == "user" else "Assistant"
+        lines.append(f"{role}: {m['content']}")
+    lines.append("Assistant:")
+    return "\n".join(lines)
+
+
+def chat_ollama(text: str, model: str) -> str:
+    messages.append({"role": "user", "content": text})
+    _trim()
+
+    prompt = _local_prompt()
+    print("Thinking (local)...", flush=True)
+
+    r = requests.post(
+        "http://127.0.0.1:11434/api/generate",
+        json={"model": model, "prompt": prompt, "stream": False},
+        timeout=180,
+    )
+    r.raise_for_status()
+
+    reply = (r.json().get("response") or "").strip()
+    messages.append({"role": "assistant", "content": reply})
+    _trim()
+    return reply
+
+
 def generate(text: str, route: dict):
     backend = route["backend"]
-    msgs = memory.list()
-
     if backend == "openai":
-        reply = backend_openai(client, msgs, text, route["chat_model"])
-        memory.trim()
-        return reply, "openai"
-
+        return chat_openai(text, route["chat_model"]), "openai"
     if backend == "ollama":
-        reply = backend_ollama(
-            msgs,
-            text,
-            route["ollama_model"],
-            OLLAMA_URL,
-            local_turns=LOCAL_TURNS,
-        )
-        memory.trim()
-        return reply, "ollama"
-
+        return chat_ollama(text, route["ollama_model"]), "ollama"
     raise ValueError(f"Unknown backend: {backend}")
 
 
 # ----------------------------
-# INTERRUPT
+# INTERRUPTIBLE SPEECH
 # ----------------------------
 
+def speak(text: str):
+    """Start TTS; if already speaking, stop and replace."""
+    global tts_proc
+    if not text:
+        return
+
+    with tts_lock:
+        # stop any currently-speaking process
+        if tts_proc and tts_proc.poll() is None:
+            try:
+                tts_proc.terminate()
+            except Exception:
+                pass
+
+        tts_proc = subprocess.Popen(
+            [TTS_ENGINE, "-v", TTS_VOICE, "-s", str(TTS_RATE), text],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+
 def interrupt():
+    """Cancel current turn and stop any active TTS."""
+    global tts_proc
     cancel_turn.set()
-    tts.interrupt()
+
+    with tts_lock:
+        if tts_proc and tts_proc.poll() is None:
+            try:
+                tts_proc.terminate()
+            except Exception:
+                pass
+
     print("interrupted", flush=True)
+
+
+# ----------------------------
+# TURN HANDLING
+# ----------------------------
+
+def run_turn(audio, route):
+    text = transcribe(audio)
+    if not text:
+        return
+
+    print("\nYou:", text, flush=True)
+
+    reply, backend = generate(text, route)
+
+    if cancel_turn.is_set():
+        print("(cancelled turn — ignoring reply)", flush=True)
+        return
+
+    print(f"Assistant ({backend}): {reply}\n", flush=True)
+    speak(reply)
+
+
+def run_wake_word_turn():
+    if cancel_turn.is_set():
+        return
+
+    print("[WAKE] triggered", flush=True)
+
+    stop_event = threading.Event()
+
+    def stop_later():
+        sd.sleep(4000)  # record ~4 seconds after wake trigger
+        stop_event.set()
+
+    stopper = threading.Thread(target=stop_later, daemon=True)
+    stopper.start()
+
+    print("recording (wake)...", flush=True)
+    audio = record_audio(stop_event)
+
+    if cancel_turn.is_set():
+        print("(cancelled wake turn)", flush=True)
+        return
+
+    run_turn(audio, ROUTES["red"])
 
 
 # ----------------------------
@@ -156,17 +364,31 @@ def interrupt():
 # ----------------------------
 
 print("==============================================")
-print(" Lab Partner — Dual PTT + Interrupt + Skills")
+print(" Lab Partner — Dual PTT + Interrupt")
 print("==============================================")
 print("Red = OpenAI | Green = Local | Yellow = Interrupt")
+if WAKE_ENABLED:
+    print("Wake word enabled")
 print("Ctrl+C to quit.\n")
-
-hud.set("idle")
 
 device = InputDevice(DEVICE_PATH)
 
+wake_listener = None
+if WAKE_ENABLED:
+    try:
+        wake_listener = WakeWordListener(
+            model_name=WAKE_CFG.get("model_name", "alexa"),
+            threshold=WAKE_CFG.get("threshold", 0.5),
+            cooldown=WAKE_CFG.get("cooldown", 2.0),
+            sample_rate=SAMPLE_RATE,
+            callback=run_wake_word_turn,
+        )
+        wake_listener.start()
+    except Exception as e:
+        print(f"[WAKE] failed to start: {e}", flush=True)
+
 is_recording = False
-stop_event: Optional[threading.Event] = None
+stop_event = None
 active_route = None
 
 try:
@@ -175,23 +397,17 @@ try:
         if event.type != ecodes.EV_KEY:
             continue
 
-        # ----------------
-        # INTERRUPT
-        # ----------------
+        # Interrupt (press)
         if event.code == INTERRUPT_KEY and event.value == 1:
             interrupt()
             continue
 
-        # ----------------
-        # PTT KEYS
-        # ----------------
+        # PTT keys (red/green)
         if event.code in (RED_KEY, GREEN_KEY):
 
             # PRESS
             if event.value == 1:
-
                 cancel_turn.clear()
-
                 is_recording = True
                 stop_event = threading.Event()
 
@@ -199,20 +415,17 @@ try:
                 active_route = ROUTES["red"] if is_red else ROUTES["green"]
 
                 label = "openai" if is_red else "local"
-
                 print(f"recording ({label})...", flush=True)
-                hud.set("recording", label)
 
                 def runner():
                     global audio_buffer
-                    audio_buffer = record_audio(stop_event, SAMPLE_RATE)
+                    audio_buffer = record_audio(stop_event)
 
                 record_thread = threading.Thread(target=runner, daemon=True)
                 record_thread.start()
 
             # RELEASE
             elif event.value == 0 and is_recording:
-
                 is_recording = False
 
                 if stop_event:
@@ -221,75 +434,10 @@ try:
                 if record_thread:
                     record_thread.join(timeout=2.0)
 
-                text = transcribe(
-                    client,
-                    audio_buffer,
-                    SAMPLE_RATE,
-                    cfg["models"]["stt"]
-                )
-
-                if not text:
-                    hud.set("idle")
-                    continue
-
-                print("\nYou:", text, flush=True)
-
-                if LOG_ENABLED:
-                    append_jsonl(
-                        LOG_PATH,
-                        {"ts": time.time(), "role": "user", "text": text},
-                    )
-
-                # ----------------
-                # SKILL ROUTER
-                # ----------------
-
-                handled, skill_reply = run_skill(text)
-
-                if handled:
-
-                    reply = skill_reply
-                    backend = "skill"
-
-                else:
-
-                    backend_label = "openai" if active_route.get("backend") == "openai" else "local"
-                    hud.set("thinking", backend_label)
-
-                    reply, backend = generate(text, active_route)
-
-                # ----------------
-                # INTERRUPT CHECK
-                # ----------------
-
-                if cancel_turn.is_set():
-                    print("(cancelled turn — ignoring reply)", flush=True)
-                    hud.set("idle")
-                    continue
-
-                print(f"Assistant ({backend}): {reply}\n", flush=True)
-
-                if LOG_ENABLED:
-                    append_jsonl(
-                        LOG_PATH,
-                        {
-                            "ts": time.time(),
-                            "role": "assistant",
-                            "backend": backend,
-                            "text": reply
-                        },
-                    )
-
-                tts.speak(reply)
-
+                run_turn(audio_buffer, active_route)
 
 except KeyboardInterrupt:
-
     print("\nExiting...", flush=True)
-
-    try:
-        hud.shutdown()
-    except Exception:
-        pass
-
-    hud.set("idle")
+finally:
+    if wake_listener:
+        wake_listener.stop()

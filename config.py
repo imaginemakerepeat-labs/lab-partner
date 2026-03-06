@@ -30,6 +30,15 @@ DEFAULT_CONFIG = {
     "ollama": {"url": "http://127.0.0.1:11434/api/chat"},
     "maynard": {"enabled": True, "ip": "10.0.0.4", "port": 9000},
     "prompt_files": {"persona": "persona.txt", "knowledge_base": "knowledge_base.txt"},
+
+    "wake_word": {
+    "enabled": true,
+    "model": "alexa",
+    "threshold": 0.6,
+    "cooldown": 2.0,
+    "command_seconds": 4
+    }
+
 }
 
 # ----------------------------
