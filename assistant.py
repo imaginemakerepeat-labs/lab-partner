@@ -407,8 +407,23 @@ def run_wake_word_turn():
         # Stage 1: acknowledge wake word
         speak("Yes?", "WAKE")
 
-        # Small pause so TTS starts/finishes cleanly before follow-up recording
-        time.sleep(1.0)
+        # Wait for the acknowledgement to finish speaking
+        start_wait = time.time()
+        while tts_active.is_set():
+            if cancel_turn.is_set():
+                if hud_mod:
+                    hud_state(
+                        state=getattr(hud_mod, "STATE_IDLE", "idle"),
+                        status="Idle",
+                        memory=len(messages),
+                    )
+                return
+            if time.time() - start_wait > 3.0:
+                break
+            time.sleep(0.05)
+
+        # Small natural pause before listening
+        time.sleep(0.25)
 
         if cancel_turn.is_set():
             if hud_mod:
