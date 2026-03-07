@@ -20,12 +20,9 @@ class WakeWordListener:
         self.model = None
 
     def start(self):
-        # Lazy import so normal assistant startup does not explode
-        import openwakeword
         from openwakeword.model import Model
 
-        openwakeword.utils.download_models()
-        self.model = Model(wakeword_models=[self.model_name])
+        self.model = Model(wakeword_model_paths=[self.model_name])
 
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
