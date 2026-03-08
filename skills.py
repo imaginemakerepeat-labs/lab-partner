@@ -3,6 +3,7 @@
 import os
 import shutil
 import datetime
+from web_search import search_web, format_results
 
 
 def run_skill(text: str):
@@ -36,7 +37,7 @@ def run_skill(text: str):
         or "todays date" in t
         or "what day is it" in t
         or "what day is today" in t
-        or "date" == t
+        or t == "date"
     ):
         now = datetime.datetime.now()
         current_date = now.strftime("%A, %B %d, %Y").replace(" 0", " ")
@@ -70,6 +71,44 @@ def run_skill(text: str):
     # ----------------
     if "hostname" in t or "host name" in t:
         return True, f"This system is {os.uname().nodename}."
+
+    # ----------------
+    # WEB SEARCH
+    # ----------------
+    prefixes = [
+        "search the web for ",
+        "look up ",
+        "search online for ",
+        "look online for ",
+        "do a web search for ",
+        "do a web search on ",
+        "web search for ",
+        "web search on ",
+    ]
+
+    matched_prefix = None
+    for prefix in prefixes:
+        if t.startswith(prefix):
+            matched_prefix = prefix
+            break
+
+    if matched_prefix:
+        query = t[len(matched_prefix):].strip(" .,!?")
+
+        if not query:
+            return True, "What would you like me to search for?"
+
+        blocked_terms = ["porn", "sex", "torrent", "pirate"]
+        for b in blocked_terms:
+            if b in query:
+                return True, "I cannot search for that."
+
+        try:
+            results = search_web(query, max_results=3)
+            formatted = format_results(results)
+            return True, f"I searched the web for '{query}'. Here are the top results:\n\n{formatted}"
+        except Exception as e:
+            return True, f"I tried to search the web but encountered an error: {e}"
 
     # ----------------
     # NOTHING MATCHED
