@@ -399,7 +399,7 @@ def run_wake_word_turn():
         if hud_mod:
             hud_state(
                 state=getattr(hud_mod, "STATE_SPEAKING", "speaking"),
-                status="Wake acknowledged...",
+                status="Wake acknowledged",
                 backend="WAKE",
                 memory=len(messages),
             )
@@ -438,7 +438,7 @@ def run_wake_word_turn():
         if hud_mod:
             hud_state(
                 state=getattr(hud_mod, "STATE_RECORDING", "recording"),
-                status="Listening for command...",
+                status="Listening for command",
                 backend="WAKE",
                 memory=len(messages),
             )
