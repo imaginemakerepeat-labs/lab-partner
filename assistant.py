@@ -27,29 +27,27 @@ Maynard mouth:
 """
 
 import sys
-import json
 import time
-import subprocess
 import threading
 from queue import Queue, Empty
 
-import requests
 import numpy as np
 from dotenv import load_dotenv
 from openai import OpenAI
 from evdev import InputDevice, ecodes
+
 from config import load_config, append_jsonl, read_text_file
-from audio import record_audio, transcribe 
+from audio import record_audio, transcribe
 from memory import trim_messages
 from mouth import MouthController
 from tts import TTSController
 
 from backends.openai_backend import chat_openai
 from backends.ollama_backend import chat_ollama
-
 from skills import run_skill
-
 from wake_word import WakeWordListener
+
+
 # ----------------------------
 # INIT
 # ----------------------------
@@ -69,7 +67,6 @@ TTS_VOICE = cfg["tts"]["voice"]
 TTS_RATE = str(cfg["tts"]["rate"])
 
 tts = TTSController(TTS_ENGINE, TTS_VOICE, TTS_RATE)
-
 
 LOG_ENABLED = bool(cfg["logging"]["enabled"])
 LOG_PATH = cfg["logging"]["path"]
@@ -96,17 +93,17 @@ WAKE_ENABLED = bool(WAKE_CFG.get("enabled", False))
 WAKE_MODEL = WAKE_CFG.get("model_path", "")
 WAKE_THRESHOLD = float(WAKE_CFG.get("threshold", 0.6))
 WAKE_COOLDOWN = float(WAKE_CFG.get("cooldown", 2.0))
-WAKE_COMMAND_SECONDS = float(WAKE_CFG.get("command_seconds", 4))
 WAKE_FOLLOWUP_SECONDS = float(WAKE_CFG.get("followup_seconds", 4))
 
 
 # ----------------------------
-# HUD (your hud.py uses run_hud(queue))
+# HUD
 # ----------------------------
 
 hud_queue = None
 hud_thread = None
 hud_mod = None
+
 
 def hud_put(payload: dict) -> None:
     global hud_queue
@@ -117,8 +114,10 @@ def hud_put(payload: dict) -> None:
     except Exception:
         pass
 
+
 try:
     import hud as hud_mod
+
     hud_queue = Queue()
     hud_thread = threading.Thread(target=hud_mod.run_hud, args=(hud_queue,), daemon=True)
     hud_thread.start()
@@ -127,6 +126,7 @@ except Exception as e:
     print(f"HUD not started: {e}", flush=True)
     hud_queue = None
     hud_mod = None
+
 
 def hud_state(state: str, status: str = "", backend: str = "", flash: bool = False, memory: int = 0) -> None:
     payload = {"state": state, "status": status, "flash": flash, "memory": memory}
@@ -159,22 +159,31 @@ if system_prompt:
     messages.append({"role": "system", "content": system_prompt})
 
 cancel_turn = threading.Event()
+quit_flag = threading.Event()
 
 tts_proc = None
 tts_lock = threading.Lock()
 
 is_recording = False
-active_route_key = None   # "red" or "green"
+active_route_key = None  # "red" or "green"
 stop_event = None
 rec_thread = None
 audio_holder = {"audio": np.array([], dtype=np.float32)}
 
+wake_busy = threading.Event()
+tts_active = threading.Event()
+
 mouth = MouthController(MAYNARD_ENABLED, MAYNARD_IP, MAYNARD_PORT)
+
+kbd_q: Queue[str] = Queue()
+
+device = None
+wake_listener = None
+
 
 # ----------------------------
 # CHAT
 # ----------------------------
-
 
 def generate(route_key: str, user_text: str) -> tuple[str, str]:
     global messages
@@ -197,18 +206,67 @@ def generate(route_key: str, user_text: str) -> tuple[str, str]:
     raise ValueError(f"Unknown backend: {backend}")
 
 
+def answer_from_web_context(user_text: str, payload: dict) -> tuple[str, str]:
+    results = payload.get("results", [])
+    page = payload.get("page")
+
+    evidence = []
+
+    for i, r in enumerate(results, start=1):
+        evidence.append(
+            f"[Result {i}]\n"
+            f"Title: {r.get('title', '')}\n"
+            f"URL: {r.get('url', '')}\n"
+            f"Snippet: {r.get('snippet', '')}"
+        )
+
+    if page:
+        evidence.append(
+            f"[Top Page]\n"
+            f"Title: {page.get('title', '')}\n"
+            f"URL: {page.get('url', '')}\n"
+            f"Text:\n{page.get('text', '')}"
+        )
+
+    evidence_text = "\n\n".join(evidence)
+
+    temp_messages = [
+        {
+            "role": "system",
+            "content": (
+                "Answer the user's question using only the web evidence below. "
+                "Do not invent facts. If evidence is weak or incomplete, say so. "
+                "Be concise and helpful."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Question: {user_text}\n\nEvidence:\n{evidence_text}",
+        },
+    ]
+
+    reply = chat_openai(
+        client,
+        temp_messages,
+        cancel_turn,
+        user_text="",
+        model=OPENAI_CHAT_MODEL_DEFAULT,
+    )
+
+    return reply, "WEB+OPENAI"
+
+
 # ----------------------------
 # SPEAK + INTERRUPT
 # ----------------------------
 
-wake_busy = threading.Event()
-tts_active = threading.Event()
-
 def speak(text: str, backend_label: str):
-    tts_active.set()
     global tts_proc
+
     if not text:
         return
+
+    tts_active.set()
 
     mouth_stop = threading.Event()
     threading.Thread(target=mouth.ticker_loop, args=(mouth_stop, cancel_turn), daemon=True).start()
@@ -226,15 +284,15 @@ def speak(text: str, backend_label: str):
     tts_proc = tts.speak(text)
 
     def _cleanup(proc, stop_evt):
-        tts_active.clear()
         try:
             proc.wait()
         finally:
+            tts_active.clear()
             stop_evt.set()
-            
+
             mouth.send("close", why="tts_end")
             mouth.send("clear", why="tts_end")
-            
+
             if hud_mod:
                 hud_state(
                     state=getattr(hud_mod, "STATE_IDLE", "idle"),
@@ -248,6 +306,7 @@ def speak(text: str, backend_label: str):
 
 def interrupt():
     global tts_proc
+
     cancel_turn.set()
 
     with tts_lock:
@@ -337,22 +396,8 @@ def stop_record_and_handle():
         return
 
     print(f"\nYou: {text}", flush=True)
+
     handled, skill_reply = run_skill(text)
-
-    if handled:
-        reply = skill_reply
-        backend_label = "SKILL"
-
-        print(f"Assistant ({backend_label}): {reply}\n", flush=True)
-
-        if LOG_ENABLED:
-            append_jsonl(
-                LOG_PATH,
-                {"ts": time.time(), "role": "assistant", "text": reply, "backend": backend_label},
-            )
-
-        speak(reply, backend_label)
-        return
 
     if LOG_ENABLED:
         append_jsonl(LOG_PATH, {"ts": time.time(), "role": "user", "text": text, "route": active_route_key})
@@ -364,7 +409,14 @@ def stop_record_and_handle():
             memory=len(messages),
         )
 
-    reply, backend_label = generate(active_route_key, text)
+    if handled:
+        if isinstance(skill_reply, dict) and skill_reply.get("mode") == "web_context":
+            reply, backend_label = answer_from_web_context(text, skill_reply)
+        else:
+            reply = skill_reply
+            backend_label = "SKILL"
+    else:
+        reply, backend_label = generate(active_route_key, text)
 
     if cancel_turn.is_set():
         print("(cancelled — ignoring reply)", flush=True)
@@ -387,7 +439,7 @@ def stop_record_and_handle():
 def run_wake_word_turn():
     global audio_holder
 
-    if is_recording or tts_active.is_set() or wake_busy.is_set():
+    if is_recording or tts_active.is_set() or wake_busy.is_set() or quit_flag.is_set():
         return
 
     wake_busy.set()
@@ -407,10 +459,9 @@ def run_wake_word_turn():
         # Stage 1: acknowledge wake word
         speak("Yes?", "WAKE")
 
-        # Wait for the acknowledgement to finish speaking
         start_wait = time.time()
         while tts_active.is_set():
-            if cancel_turn.is_set():
+            if cancel_turn.is_set() or quit_flag.is_set():
                 if hud_mod:
                     hud_state(
                         state=getattr(hud_mod, "STATE_IDLE", "idle"),
@@ -422,10 +473,9 @@ def run_wake_word_turn():
                 break
             time.sleep(0.05)
 
-        # Small natural pause before listening
         time.sleep(0.25)
 
-        if cancel_turn.is_set():
+        if cancel_turn.is_set() or quit_flag.is_set():
             if hud_mod:
                 hud_state(
                     state=getattr(hud_mod, "STATE_IDLE", "idle"),
@@ -434,7 +484,6 @@ def run_wake_word_turn():
                 )
             return
 
-        # Stage 2: listen for the actual command
         if hud_mod:
             hud_state(
                 state=getattr(hud_mod, "STATE_RECORDING", "recording"),
@@ -489,9 +538,13 @@ def run_wake_word_turn():
         print(f"\nYou: {text}", flush=True)
 
         handled, skill_reply = run_skill(text)
+
         if handled:
-            reply = skill_reply
-            backend_label = "SKILL"
+            if isinstance(skill_reply, dict) and skill_reply.get("mode") == "web_context":
+                reply, backend_label = answer_from_web_context(text, skill_reply)
+            else:
+                reply = skill_reply
+                backend_label = "SKILL"
         else:
             reply, backend_label = generate("red", text)
 
@@ -513,14 +566,15 @@ def run_wake_word_turn():
 
         speak(reply, backend_label)
 
+    except Exception as e:
+        print(f"[WAKE] callback error: {e}", flush=True)
     finally:
         wake_busy.clear()
+
+
 # ----------------------------
 # KEYBOARD THREAD
 # ----------------------------
-
-kbd_q: Queue[str] = Queue()
-quit_flag = threading.Event()
 
 def keyboard_thread():
     while not quit_flag.is_set():
@@ -535,6 +589,7 @@ def keyboard_thread():
         except Exception:
             time.sleep(0.1)
 
+
 def print_help():
     print("\nKeyboard controls (type + Enter):")
     print("  o  -> toggle OpenAI record start/stop")
@@ -542,6 +597,51 @@ def print_help():
     print("  i  -> interrupt")
     print("  q  -> quit")
     print("  h  -> help\n", flush=True)
+
+
+# ----------------------------
+# CLEAN SHUTDOWN
+# ----------------------------
+
+def shutdown():
+    global device, wake_listener, tts_proc
+
+    quit_flag.set()
+    cancel_turn.set()
+
+    with tts_lock:
+        try:
+            if tts_proc and tts_proc.poll() is None:
+                tts_proc.terminate()
+                tts_proc.wait(timeout=1.0)
+        except Exception:
+            pass
+
+    if wake_listener:
+        try:
+            wake_listener.stop()
+        except Exception:
+            pass
+
+    if device:
+        try:
+            device.close()
+        except Exception:
+            pass
+
+    try:
+        mouth.send("close", why="exit")
+        mouth.send("clear", why="exit")
+    except Exception:
+        pass
+
+    if hud_queue is not None:
+        try:
+            hud_queue.put({"cmd": "quit"})
+        except Exception:
+            pass
+
+    time.sleep(0.3)
 
 
 # ----------------------------
@@ -566,9 +666,6 @@ threading.Thread(target=keyboard_thread, daemon=True).start()
 
 device = InputDevice(DEVICE_PATH)
 
-
-wake_listener = None
-
 if WAKE_ENABLED:
     try:
         wake_listener = WakeWordListener(
@@ -589,7 +686,6 @@ except Exception:
 
 try:
     while True:
-        # Keyboard commands
         try:
             cmd = kbd_q.get_nowait()
         except Empty:
@@ -600,7 +696,6 @@ try:
                 print_help()
             elif cmd in ("q", "quit", "exit"):
                 print("Quitting...", flush=True)
-                quit_flag.set()
                 break
             elif cmd in ("i", "interrupt"):
                 interrupt()
@@ -617,16 +712,26 @@ try:
             else:
                 print(f"(unknown cmd) {cmd} — type 'h' for help", flush=True)
 
-        # Gamepad events without blocking keyboard responsiveness
         if select is None:
             time.sleep(0.01)
             continue
+
+        if device is None:
+            break
 
         rlist, _, _ = select.select([device.fd], [], [], 0.01)
         if not rlist:
             continue
 
-        for event in device.read():
+        try:
+            events = device.read()
+        except OSError as e:
+            if e.errno == 9:
+                print("[INPUT] device closed", flush=True)
+                break
+            raise
+
+        for event in events:
             if event.type != ecodes.EV_KEY:
                 continue
 
@@ -643,24 +748,4 @@ try:
 except KeyboardInterrupt:
     print("\nExiting...", flush=True)
 finally:
-    quit_flag.set()
-    try:
-        device.close()
-    except Exception:
-        pass
-    try:
-        mouth.send("close", why="exit")
-        mouth.send("clear", why="exit")
-    except Exception:
-        pass
-    if hud_queue is not None:
-        try:
-            hud_queue.put({"cmd": "quit"})
-        except Exception:
-            pass
-
-    if wake_listener:
-        try:
-            wake_listener.stop()
-        except Exception:
-            pass
+    shutdown()
