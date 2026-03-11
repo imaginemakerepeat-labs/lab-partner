@@ -3,8 +3,7 @@
 import os
 import shutil
 import datetime
-from web_search import search_web, format_results
-
+from web_search import search_and_extract
 
 def run_skill(text: str):
     """
@@ -72,29 +71,31 @@ def run_skill(text: str):
     if "hostname" in t or "host name" in t:
         return True, f"This system is {os.uname().nodename}."
 
+    
+    import re
+
     # ----------------
     # WEB SEARCH
     # ----------------
-    prefixes = [
-        "search the web for ",
-        "look up ",
-        "search online for ",
-        "look online for ",
-        "do a web search for ",
-        "do a web search on ",
-        "web search for ",
-        "web search on ",
+    web_patterns = [
+        r"\bsearch the web for\s+(.+)",
+        r"\bsearch online for\s+(.+)",
+        r"\blook online for\s+(.+)",
+        r"\blook up\s+(.+)",
+        r"\bweb search for\s+(.+)",
+        r"\bweb search on\s+(.+)",
+        r"\bdo a web search for\s+(.+)",
+        r"\bdo a web search on\s+(.+)",
     ]
 
-    matched_prefix = None
-    for prefix in prefixes:
-        if t.startswith(prefix):
-            matched_prefix = prefix
+    query = None
+    for pattern in web_patterns:
+        m = re.search(pattern, t)
+        if m:
+            query = m.group(1).strip(" .,!?")
             break
 
-    if matched_prefix:
-        query = t[len(matched_prefix):].strip(" .,!?")
-
+    if query is not None:
         if not query:
             return True, "What would you like me to search for?"
 
@@ -104,9 +105,8 @@ def run_skill(text: str):
                 return True, "I cannot search for that."
 
         try:
-            results = search_web(query, max_results=3)
-            formatted = format_results(results)
-            return True, f"I searched the web for '{query}'. Here are the top results:\n\n{formatted}"
+            payload = search_and_extract(query)
+            return True, payload
         except Exception as e:
             return True, f"I tried to search the web but encountered an error: {e}"
 
